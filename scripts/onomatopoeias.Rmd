@@ -1,0 +1,920 @@
+---
+title: "Analysis of onomatopoeias"
+author: "Bodo"
+date: "16/11/2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This analysis will focus on the onomatopoeias, and using the full dataset that's available as no hand annotation is required.
+
+# Setup
+
+Load packages:
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(tidytext) # for unnest_tokens()
+library(brms)
+library(wordcloud) # for word cloud
+```
+
+Get all file names:
+
+```{r}
+birds <- read_csv('../data/birds_master_file_annotated_12_02_25.csv')
+```
+
+**Note to self:** What are these problems?
+
+# Onomatopoeia and word count analyses
+
+Count onomatopoeias and warblishes:
+
+```{r}
+birds <- mutate(birds,
+                onom_count = str_count(voice, '\\".+?\\"'),
+                warblish_count = str_count(voice, '\\*.+?\\*'))
+```
+
+Count the words and add a count variable:
+
+```{r}
+word_counts <- birds |> 
+  unnest_tokens(word, voice) |> 
+  count(unique_id) |> 
+  rename(word_count = n)
+```
+
+Join that back in:
+
+```{r}
+birds <- left_join(birds, word_counts)
+```
+
+Plot of onomatopoeia count with word count:
+
+```{r}
+birds |> 
+  ggplot(aes(x = onom_count, y = word_count)) +
+  geom_point() +
+  theme_classic()
+```
+
+Create a has onomatopoeia / has no onomatopoeia variable and see whether we can make more sense of that:
+
+```{r}
+birds <- mutate(birds,
+                has_onom = if_else(onom_count > 0, 'has onomatopoeia', 'no onomatopoeia'))
+```
+
+Check word counts for those:
+
+```{r}
+birds |> 
+  ggplot(aes(x = has_onom, y = word_count, fill = has_onom)) +
+  scale_fill_manual(values = c('goldenrod3', 'purple', 'darkgrey')) +
+  geom_boxplot() +
+  theme_minimal() +
+  theme(legend.position = 'none')
+```
+
+So, if there is an onomatopoeia it's also a longer text. I guess this makes sense if what's happening here is that some fieldguides just generally have more info, and they're also going to contain more onomatopoeias.
+
+# Individualizing onomatopoeia patterns
+
+## Extract onomatopoeia
+
+Extract onomatopoeias and warblish:
+
+```{r}
+# Extract onomatopoeias:
+
+birds$onoms <- sapply(str_extract_all(birds$voice, '\\".+?\\"'),
+                      function(x) str_c(x, collapse = '_'))
+```
+
+Create an onomatopoeia-free version of the text to see if we can compare things to the typographically unmarked ones:
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = str_replace_all(voice_reduced, '\\".+?\\"', ''),
+                voice_reduced = str_replace_all(voice_reduced, '\\*.+?\\*', ''))
+```
+
+## Preceding character
+
+Get the directly preceding character:
+
+```{r}
+birds$preceding_char <- sapply(
+  str_match_all(birds$voice, '(\\S)\\s*\\".+?\\"'), 
+  function(x) str_c(x[,2], collapse = '_')
+  )
+```
+
+Check if there's any where the separator counts don't match:
+
+```{r}
+birds |>
+  filter(!(str_count(onoms, '_') == str_count(preceding_char, '_'))) |>
+  select(onoms, preceding_char, voice)
+```
+
+This is whenever the onomatopoeia is first. So, let's append an empty space before that with the separator (these are all multi-onomatopoeia entries):
+
+```{r}
+fixed_preceding_chars <- birds |>
+  filter(!(str_count(onoms, '_') == str_count(preceding_char, '_'))) |>
+  select(onoms, preceding_char, voice) |> 
+  mutate(preceding_char = str_c(' _', preceding_char)) |> 
+  pull(preceding_char)
+```
+
+And add that back into the data:
+
+```{r}
+# Get offending rows:
+
+rows_to_fix <- !(str_count(birds$onoms, '_') == str_count(birds$preceding_char, '_'))
+rows_to_fix <- which(rows_to_fix)
+
+# Re-add the fixed strings:
+
+birds[rows_to_fix, ]$preceding_char <- fixed_preceding_chars
+```
+
+Check now that it's the correct number each time:
+
+```{r}
+birds |> 
+  filter(!(str_count(onoms, '_') == str_count(preceding_char, '_')))
+```
+
+Woohoo, it is!
+
+## Following character
+
+Let's get the last character now:
+
+```{r}
+birds$following_char <- sapply(
+  str_match_all(birds$voice, '\\".+?\\"\\s*(\\S)'), 
+  function(x) str_c(x[,2], collapse = '_')
+)
+```
+
+Check when they don't align:
+
+```{r}
+birds |> 
+  filter(!(str_count(onoms, '_') == str_count(following_char, '_'))) |> 
+  pull(voice)
+```
+
+Ok, essentially just two offending patterns, which are either the onomatopoeia is last, as in 1 and 2, or there's just a space and then the next onomatopoeia already starts, with nothing intervening.
+
+Get these offending rows:
+
+```{r}
+rows_to_fix <- !(str_count(birds$onoms, '_') == str_count(birds$following_char, '_'))
+rows_to_fix <- which(rows_to_fix)
+```
+
+THen we'll fix these by hand - it's only a couple cases anyway:
+
+```{r}
+birds[rows_to_fix, ]$following_char <- c(';_l_;_ ',
+                                         'w_ ',
+                                         ',_,_,_ _-',
+                                         ';_;_ ',
+                                         'i_ _a')
+```
+
+## Extract preceding word
+
+Extract preceding word:
+
+```{r}
+birds$preceding_word <- sapply(
+  str_match_all(birds$voice, '(?:(\\b\\S+)\\s+)?\\".+?\\"'), 
+  function(x) str_c(ifelse(is.na(x[,2]), "", x[,2]), collapse = '_')
+)
+```
+
+Now, check if there's any mismatching numbers:
+
+```{r}
+filter(birds,
+       !(str_count(preceding_word, '_') == str_count(onoms, '_')))
+```
+
+None, perfect.
+
+```{r}
+birds$following_word <- sapply(
+  str_match_all(birds$voice, '\\".+?\\"\\s+(\\b\\S+)?'),
+  function(x) str_c(ifelse(is.na(x[,2]), "", x[,2]), collapse = '_')
+)
+```
+
+Check that it's the same number:
+
+```{r}
+filter(birds,
+       !(str_count(following_word, '_') == str_count(onoms, '_')))
+```
+
+This doesn't work yet. **Note**: Fix later.
+
+## Put onomatopoeias into long format
+
+Get only the rows we need:
+
+```{r}
+onoms_only <- birds |>
+  select(unique_id, voice, onoms, preceding_char, preceding_word, following_char)
+```
+
+Make it into long format:
+
+```{r}
+onoms_long <- onoms_only |> 
+  separate_longer_delim(c(onoms, preceding_char, preceding_word, following_char),
+                        delim = '_')
+
+# Change order:
+
+onoms_long <- onoms_long |>
+  select(unique_id, voice, preceding_char, following_char, preceding_word, onoms) |> 
+  rename(onomatopoeia = onoms)
+
+# Fill empty rows with NAs:
+
+onoms_long <- mutate(onoms_long,
+                     preceding_char = if_else(preceding_char == '', NA, preceding_char),
+                     following_char = if_else(following_char == '', NA, following_char),
+                     preceding_word = if_else(preceding_word == '', NA, preceding_word),
+                     onomatopoeia = if_else(onomatopoeia == '', NA, onomatopoeia))
+```
+
+## Get rid of quotes
+
+Now let's get rid of the quotes:
+
+```{r}
+onoms_long <- mutate(onoms_long,
+                     onomatopoeia = str_replace_all(onomatopoeia, '\"', ''))
+```
+
+## Extract for hand annotation
+
+For hand-annotation, we'll create two extra columns:
+
+```{r}
+# onoms_long$phono_legal <- NA
+# onoms_long$complex_onset <- NA
+```
+
+Write it to file outside of R:
+
+```{r}
+# write_csv(onoms_long,
+#           '../data/onomatopoeias_all_extracted.csv')
+```
+
+# Syntactic explorations
+
+## Onomatopoeia length and sentence position
+
+Calculate the length of the onomatopoeias:
+
+```{r}
+onoms_long <- mutate(onoms_long,
+                     length = str_count(onomatopoeia, '.'))
+```
+
+Check what precedes:
+
+```{r}
+onoms_long |> 
+  count(preceding_char, sort = TRUE) |>
+  print(n = Inf)
+```
+
+Any letter or number is within the sentence:
+
+```{r}
+onoms_long <- onoms_long |>
+  mutate(pre_isolation = if_else(preceding_char %in% letters,
+                                 'in sentence', preceding_char),
+         pre_isolation = if_else(pre_isolation %in% LETTERS,
+                                 'in sentence', pre_isolation),
+         pre_isolation = if_else(pre_isolation %in% as.character(0:9),
+                                 'in sentence', pre_isolation),
+         pre_isolation = if_else(pre_isolation == ' ',
+                                 'starts sentence', pre_isolation),
+         pre_isolation = if_else(pre_isolation == '.',
+                                 'starts sentence', pre_isolation),
+         pre_isolation = if_else(pre_isolation == '(',
+                                 'in brackets', pre_isolation),
+         pre_isolation = if_else(pre_isolation == '-',
+                                 'after hyphen', pre_isolation),
+         pre_isolation = if_else(pre_isolation == ';',
+                                 'after semicolon', pre_isolation),
+         pre_isolation = if_else(pre_isolation == ':',
+                                 'after colon', pre_isolation),
+         pre_isolation = if_else(pre_isolation == ',',
+                                 'after comma', pre_isolation),
+         pre_isolation = if_else(pre_isolation %in% c("=", "'", ")"),
+                                 NA, pre_isolation))
+```
+
+Check word count as a function of what comes before:
+
+```{r}
+onoms_long |> 
+  filter(!is.na(pre_isolation)) |> 
+  filter(pre_isolation != 'in brackets') |> 
+  ggplot(aes(x = reorder(pre_isolation, length), y = log(length),
+             fill = pre_isolation)) +
+  scale_fill_brewer(direction = -1,
+                    palette = 'YlGnBu') +
+  geom_boxplot(width = 0.6) +
+  xlab(NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'none')
+
+# Save:
+
+ggsave('../figures/onomatopoeia_length_by_sentence.pdf',
+       width = 4.5, height = 4)
+```
+
+## Whether it's a word and sentence position
+
+Get the CMU data:
+
+```{r}
+CMU <- readLines('../data/CMU_dict-0.7b.txt')
+CMU <- CMU[-c(1:126)] # only metadata
+CMU <- str_split(CMU, pattern = ' +')
+words <- sapply(CMU, FUN = function(x) x[1])
+words <- str_to_lower(words)
+```
+
+Check which of the onomatopoeias are also a word:
+
+```{r}
+onoms_long <- mutate(onoms_long,
+                     is_also_word = if_else(onomatopoeia %in% words,
+                                            'is also a word', 'is not a word'))
+```
+
+How many of these?
+
+```{r}
+onoms_long |> 
+  count(is_also_word)
+```
+
+Cool, let's see if any patterns emerge:
+
+```{r}
+onoms_long |> 
+  filter(!is.na(pre_isolation)) |> 
+  count(pre_isolation, is_also_word) |> 
+  group_by(pre_isolation) |> 
+  mutate(p = n / sum(n))
+```
+
+Make a plot of this:
+
+```{r}
+onoms_long |> 
+  filter(!is.na(pre_isolation)) |>
+  filter(pre_isolation != 'in brackets') |> 
+  count(pre_isolation, is_also_word) |> 
+  group_by(pre_isolation) |> 
+  mutate(p = n / sum(n)) |> 
+  filter(is_also_word == 'is also a word') |> 
+  ggplot(aes(x = reorder(pre_isolation, p), y = p,
+             fill = reorder(pre_isolation, p))) +
+  geom_col(col = 'black',
+           width = 0.6) +
+  scale_fill_brewer(direction = +1,
+                    palette = 'YlGnBu') +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 0.2)) +
+  xlab(NULL) +
+  ylab('p(is also a word)') +
+  theme_minimal() +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave('../figures/syntactic_isolation_and_dictionary_word_match.pdf',
+       width = 4.5, height = 3.5)
+```
+
+
+## Whether it has repeated consonants
+
+Count the repeated consonants:
+
+```{r}
+onoms_long <- onoms_long |> 
+  mutate(repeated_consonants = str_count(onomatopoeia, "(?i)([b-df-hj-np-tv-z])\\1+"))
+```
+
+Cool. Let's make a variable out of this that just codes for whether it has repeated consonants or not:
+
+```{r}
+onoms_long <- onoms_long |> 
+  mutate(has_repeated = if_else(repeated_consonants > 1, 'has letter replication', 'no letter replication'))
+```
+
+Check this as a function of syntax:
+
+```{r}
+onoms_long |> 
+  filter(!is.na(pre_isolation)) |> 
+  count(pre_isolation, has_repeated) |> 
+  group_by(pre_isolation) |> 
+  mutate(p = n / sum(n))
+```
+
+Make a plot of this:
+
+```{r}
+onoms_long |> 
+  filter(!is.na(pre_isolation)) |> 
+  count(pre_isolation, has_repeated) |> 
+  group_by(pre_isolation) |> 
+  mutate(p = n / sum(n)) |> 
+  filter(has_repeated == 'has letter replication') |> 
+  ggplot(aes(x = reorder(pre_isolation, p), y = p,
+             fill = reorder(pre_isolation, p))) +
+  geom_col(col = 'black',
+           width = 0.6) +
+  scale_fill_brewer(direction = +1,
+                    palette = 'YlGnBu') +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 0.3)) +
+  xlab(NULL) +
+  ylab('p(has repeated consonants)') +
+  theme_minimal() +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save:
+
+ggsave('../figures/syntactic_isolation_and_letter_replication.pdf',
+       width = 4.5, height = 3.5)
+```
+
+Make a simplified plot:
+
+```{r}
+# Simplified syntactic isolation variable:
+
+onoms_long <- mutate(onoms_long,
+                     syntax_red = if_else(pre_isolation %in% c('after colon',
+                                                               'after semicolon'),
+                                          'after juncture', NA),
+                     syntax_red = if_else(pre_isolation %in% c('starts sentence',
+                                                               'in sentence'),
+                                          'in sentence', syntax_red))
+
+# Check:
+
+onoms_long |> 
+  count(syntax_red) |> 
+  mutate(p = n / sum(n))
+
+# Check with respect to letter replication:
+
+onoms_long |> 
+  filter(!is.na(syntax_red)) |> 
+  count(syntax_red, has_repeated) |> 
+  group_by(syntax_red) |> 
+  mutate(p = n / sum(n))
+```
+
+Make a plot of this:
+
+```{r}
+onoms_long |> 
+  filter(!is.na(syntax_red)) |> 
+  count(syntax_red, has_repeated) |> 
+  group_by(syntax_red) |> 
+  mutate(p = n / sum(n)) |> 
+  filter(has_repeated == 'has letter replication') |> 
+  ggplot(aes(x = reorder(syntax_red, p), y = p,
+             fill = syntax_red)) +
+  geom_col(
+    # col = 'black',
+    col = 'white',
+    width = 0.4,
+    alpha = 0) +
+  scale_fill_manual(values = c('#68349a', 'grey')) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 0.3),
+                     breaks = seq(0, 0.3, 0.1)) +
+  xlab(NULL) +
+  ylab('p(has repeated consonants)') +
+  theme_classic() +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 0, hjust = 0.5),
+        # axis.title.y = element_text(margin = margin(r = 15)),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank()
+        )
+
+# Save:
+
+ggsave('../figures/syntactic_isolation_and_letter_replication.pdf',
+       width = 2.5, height = 3.5)
+```
+
+
+# Frequency of onomatopoeias
+
+Compute frequency of onomatopoeias:
+
+```{r}
+# Count:
+
+onom_freq <- onoms_long |> 
+  count(onomatopoeia, sort = TRUE) |> 
+  filter(!is.na(onomatopoeia))
+
+# Show:
+
+onom_freq
+```
+
+Need to fix these:
+
+```{r}
+ # " and "                                                                                          2
+ # 2 " as the strongest part. Also has various harsh scoldings: "                                     1
+ # 3 " https://ebird.org/news/crossbills-of-north-america-species-and-red-crossbill-call-types/ "     1
+ # 4 " very similar to Elf Owl; whining, soft whistle "                                               1
+ # 5 ","                                                                                              1
+ # 6 ", "                         
+```
+
+## Frequency and typographic marking
+
+See whether these also occur in the typographically unmarked positions. For this we can simply collapse the entire `voice_reduced` column into a text and then just grep out of it.
+
+To make sure that we don't match parts of words, we'll add spaces around:
+
+```{r eval = FALSE}
+all_text <- str_c(filter(birds, !is.na(voice_reduced))$voice_reduced, collapse = ' ')
+
+# Append a word start and word finish:
+
+onom_freq <- mutate(onom_freq,
+                    onomatopoeia = str_c(' ', onomatopoeia, ' '))
+
+# Empty column:
+
+onom_freq$unmarked_freq <- 0
+
+# Loop through and add count:
+
+for (i in 1:nrow(onom_freq)) {
+  onom_freq[i, ]$unmarked_freq <- onom_freq[i, ]$unmarked_freq +
+    str_count(all_text, onom_freq[i, ]$onomatopoeia)
+  
+  if (i %% 1000 == 0) {
+    cat(str_c("hello outside-loop world, I'm iteration ", i, '\n'))
+  }
+}
+
+# Save:
+
+save(onom_freq, file = '../models/onom_freq.RData')
+```
+
+Load:
+
+```{r eval = TRUE}
+load('../models/onom_freq.RData')
+```
+
+Check:
+
+```{r}
+onom_freq
+```
+
+Create a "has typographically unmarked version":
+
+```{r}
+onom_freq <- mutate(onom_freq,
+                    has_unmarked = if_else(unmarked_freq > 0, 'occurs typographically unmarked', 'no unmarked'))
+```
+
+Get rid of trailing spaces again, which we only embedded to ensure matching within the sentence.
+
+```{r}
+onom_freq <- mutate(onom_freq,
+                    onomatopoeia = str_trim(onomatopoeia))
+```
+
+Now we can get rid of those onomatopoeias that have spaces or hyphens in them. These are multisyllabic and it would be unfair / biasing towards what I want to show to keep in them analysis since they're never going to occur typographically unmarked again anyway, being essentially full phrases.
+
+So we should restrict things to the monosyllabic stuff.
+
+```{r}
+onom_freq_red <- filter(onom_freq,
+                        !str_detect(onomatopoeia, ",|-| |'|\\."))
+
+# How many are left?
+
+onom_freq_red
+```
+
+Model whether it occurs unmarked as a function of its frequency in the marked version:
+
+```{r eval = FALSE}
+onom_freq_red <- mutate(onom_freq_red,
+                        has_unmarked = factor(has_unmarked, levels = c('no unmarked', 'occurs typographically unmarked')))
+
+# Fit logistic regression model:
+
+unmarked_mdl <- brm(has_unmarked ~ 1 + log(n),
+                    data = onom_freq_red,
+                    family = bernoulli,
+                    
+                    # MCMC settings:
+                    
+                    chains = 4, iter = 4000, warmup = 2000,
+                    cores = 4, init = 0)
+
+# Save:
+
+save(unmarked_mdl, file = '../models/unmarked_mdl.RData')
+```
+
+Load:
+
+```{r eval = TRUE}
+load('../models/unmarked_mdl.RData')
+```
+
+Check model:
+
+```{r}
+unmarked_mdl
+```
+
+Make a plot of this:
+
+```{r}
+# Show:
+
+conditional_effects(unmarked_mdl)
+
+# Save:
+
+ggsave('../figures/probability_of_typographically_unmarked.pdf',
+       width = 5, height = 3.5)
+```
+
+Extract image data from `conditional_effects()` output for hand-tweaked ggplot:
+
+```{r}
+this_plot_df <- conditional_effects(unmarked_mdl)[[1]]
+```
+
+Make a custom ggplot out of this, first without the graph itself:
+
+```{r}
+this_plot_df |> 
+  ggplot(aes(x = n, y = estimate__)) +
+  geom_ribbon(mapping = aes(ymin = lower__, ymax = upper__),
+              fill = '#68349a', alpha = 0) +
+  geom_line(size = 1.5, col = '#68349a', alpha = 0) +
+  xlab('Frequency') +
+  ylab('p(unmarked)') +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0),
+                     breaks = seq(0, 1, 0.2)) +
+  theme_classic()
+
+# Save:
+
+ggsave('../figures/probability_of_typographically_unmarked.pdf',
+       width = 6, height = 3.5)
+```
+
+Then with the graph:
+
+```{r}
+this_plot_df |> 
+  ggplot(aes(x = n, y = estimate__)) +
+  geom_ribbon(mapping = aes(ymin = lower__, ymax = upper__),
+              fill = '#68349a', alpha = 0.4) +
+  geom_line(size = 1.5, col = '#68349a') +
+  xlab('Frequency') +
+  ylab('p(unmarked)') +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0),
+                     breaks = seq(0, 1, 0.2)) +
+  theme_classic()
+
+# Save:
+
+ggsave('../figures/probability_of_typographically_unmarked.pdf',
+       width = 6, height = 3.5)
+```
+
+
+
+## Frequency and sentence position
+
+See whether more frequent ones also occur in more or less isolated positions. To make some sense of this, we'll simplify lump the separated ones (after comma, semicolon, and colon) together, as well as all the within-sentence ones, for which we'll exclude the ones that start the sentence for now as we haven't checked yet whether a comma or dot follows.
+
+```{r}
+# Vectors for matching:
+
+isolated <- c('after colon', 'after comma', 'after hyphen',
+              'after semicolon')
+collapse <- c('in brackets', 'starts sentence')
+
+# Match and create new variable pre_iso_red:
+
+onoms_long <- mutate(onoms_long,
+                     pre_iso_red = if_else(pre_isolation %in% collapse, NA, pre_isolation),
+                     pre_iso_red = if_else(pre_iso_red %in% isolated, 'isolated', pre_iso_red))
+```
+
+Count by onomatopoeia and this new variable, after excluding `NA`s:
+
+```{r}
+onoms_long |> 
+  filter(!is.na(pre_iso_red)) |> 
+  count(onomatopoeia, pre_iso_red, sort = TRUE) |> 
+  group_by(onomatopoeia) |> 
+  mutate(p = n / sum(n)) |> 
+  slice_tail(n = 100) |> 
+  print(n = Inf)
+```
+
+# Frequency of syllables
+
+## Prep
+
+Create a unique identifier variable that codes for the individual onomatopoeia:
+
+```{r}
+onoms_long <- mutate(onoms_long,
+                     onom_id = str_c(unique_id, ':', onomatopoeia))
+```
+
+Split the data up by syllable:
+
+```{r}
+# Exclude NAs first:
+
+onom_sylls <- filter(onoms_long,
+                      !is.na(onomatopoeia))
+
+# Lowercase:
+
+onom_sylls <- mutate(onom_sylls,
+                      onomatopoeia = str_to_lower(onomatopoeia))
+
+# Reduce to relevant columns:
+
+onom_sylls <- select(onom_sylls, unique_id, onom_id, onomatopoeia)
+
+# Split up by special characters:
+
+onom_sylls <- onom_sylls  |> 
+  mutate(syllable = str_split(onomatopoeia,
+                                  "[-'\".,;!?(){}\\[\\]<>/|@#$%^&*_+=`~:\\s]+")) |> 
+  unnest(cols = c(syllable)) |> 
+  filter(syllable != '')
+
+# Get rid of empties:
+
+onom_sylls <- onom_sylls |>
+  filter(syllable != '')
+
+# Show:
+
+onom_sylls
+```
+
+## Counts
+
+What are the most frequent ones?
+
+```{r}
+# Count:
+
+sylls_count <- onom_sylls |> 
+  count(syllable, sort = TRUE)
+
+# Show:
+
+sylls_count
+```
+
+Let's now create a log frequency column of this:
+
+```{r}
+sylls_count <- sylls_count |> 
+  mutate(log_freq = log(n))
+```
+
+Do a left join:
+
+```{r}
+full_with_component_freq <- onom_sylls |> 
+  left_join(sylls_count) |> 
+  group_by(onom_id) |> 
+  summarize(component_freq = mean(log_freq))
+```
+
+Joint that back into onoms long:
+
+```{r}
+onoms_long <- onoms_long |> 
+  left_join(full_with_component_freq)
+```
+
+Check:
+
+```{r}
+select(onoms_long, unique_id, onom_id, onomatopoeia, component_freq)
+```
+
+Looks good!
+
+## Syntactic position and component frequency
+
+Check now whether this changes as a function of syntactic position:
+
+```{r}
+onoms_long |> 
+  group_by(pre_isolation) |> 
+  summarize(M = mean(component_freq, na.rm = TRUE))
+```
+
+Make a plot of this:
+
+```{r}
+onoms_long |> 
+  filter(!is.na(pre_isolation)) |> 
+  filter(pre_isolation != 'in brackets') |> 
+  ggplot(aes(x = reorder(pre_isolation, component_freq), y = component_freq,
+             fill = pre_isolation)) +
+  scale_fill_brewer(direction = -1,
+                    palette = 'YlGnBu') +
+  geom_boxplot(width = 0.6) +
+  xlab(NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'none')
+
+# Save:
+
+ggsave('../figures/component_freq_by_sentence_position.pdf',
+       width = 4.5, height = 4)
+```
+
+Don't see anything in here.
+
+# Word clouds
+
+
+```{r, fig.width = 8, fig.height = 6}
+# set.seed(42)
+# wordcloud(word = frequent_adjs$Word, freq = frequent_adjs$n, min.freq = 12,
+#           max.words = 120, random.order = FALSE, rot.per = 0.20,
+#           colors = brewer.pal(8, 'Dark2'),
+#           scale = c(2.5, 0.25))
+```
+
+
+
+

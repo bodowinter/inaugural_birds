@@ -1,0 +1,1974 @@
+---
+title: "Analysis of sensory words, metaphors and comparisons"
+author: "Bodo"
+date: "16/11/2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This analysis will focus on the sensory words and links with Lynott & Connell (2009). It will also look at comparisons and other categorical variables that stem from hand annotation.
+
+# Setup
+
+Load packages:
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(tidytext) # for unnest_tokens()
+library(tm) # for Corpus()
+library(topicmodels) # for topic models
+library(SnowballC) # for stemming words, wordStem()
+library(textstem) # for lemmatize_string()
+library(brms) # for Bayesian models
+library(ldatuning) # for LDA tuning / coherence scores
+library(textmineR) # for LDA tuning / coherence scores
+library(effsize) # for Cohen's d
+```
+
+Get all file names:
+
+```{r}
+birds <- read_csv('../data/birds_master_file_annotated_12_02_25.csv')
+```
+
+**Note to self:** What are these problems?
+
+Load Lynott & Connell (2009):
+
+```{r}
+lyn <- read_csv('../data/lynott_norms.csv')
+```
+
+# Temporary limited rows
+
+We'll limit things to the first 1000 rows:
+
+```{r}
+birds <- slice_head(birds,
+                    n = 1000)
+```
+
+# Preprocessing
+
+## Lynott & Connell (2009) clean-ups
+
+Clean the Lynott & Connell (2009) dataset:
+
+```{r}
+lyn <- lyn |> 
+  rename(vis = VisualStrengthMean,
+         hap = HapticStrengthMean,
+         aud = AuditoryStrengthMean,
+         olf = OlfactoryStrengthMean,
+         gus = GustatoryStrengthMean,
+         excl = ModalityExclusivity,
+         dom_mod = DominantModality) |> 
+  select(-(VisualStrengthSD:GustatoryStrengthSD)) |> 
+  select(-`Item#`,
+         -Familiarity,
+         -BNCFrequency) |> 
+  rename(word = Property) |> 
+  select(-(BNCLogFrequency:OrthographicLength)) |> 
+  mutate(dom_mod = str_to_lower(dom_mod))
+```
+
+## Count Warblish & Onomatopoeias
+
+Count Warblish and Onomatopoeias:
+
+```{r}
+birds <- mutate(birds,
+                onom_count = str_count(voice_reduced, '\\".+?\\"'),
+                warblish_count = str_count(voice_reduced, '\\*.+?\\*'))
+```
+
+Check:
+
+```{r}
+birds |> select(voice_reduced, onom_count:warblish_count)
+```
+
+## Count comparisons
+
+Create a comparisons count variable, using the `;` as a separator... this one is used when there's more than one expression, separating each comparison expression.
+
+So counting that, if it's zero, it means there was a character string - there is a comparison expression - and if there is 1 `;`, that means there's two comparison expressions:
+
+```{r}
+birds <- mutate(birds,
+                comparison_count = str_count(comparison_expression, ';'),
+                comparison_count = comparison_count + 1,
+                comparison_count = if_else(is.na(comparison_count), 0, comparison_count)) # NAs are zeros
+```
+
+But then we need to set to NA those that are not usable, because we've taken those with us as unfair zeroes against comparisons in the above:
+
+```{r}
+birds <- mutate(birds,
+                comparison_count = if_else(usable != 'yes', NA, comparison_count))
+```
+
+In addition, there are those comparison counts that have `NA` but should have a 1 because they are `comparison_only`,
+and likewise, fairly, for onomatopoeias, there should be a `0` if it's `comparison_only` (it is an interesting question though whether the expression linked backed to would contain onomatopoeia):
+
+```{r}
+birds <- mutate(birds,
+                comparison_count = if_else(usable == 'comparison_only', 1, comparison_count),
+                onom_count = if_else(usable == 'comparison_only', 0, onom_count),
+                warblish_count = if_else(usable == 'comparison_only', 0, warblish_count))
+```
+
+## Create cleaned comparison table object
+
+Extract only those expressions that contain comparisons:
+
+```{r}
+comp_only <- filter(birds,
+                    complete.cases(comparison_expression)) |>
+  select(-length, -warblish, -(non_vocalization:mimicry),
+         -(comments:comparison_count))
+```
+
+
+**Note**: The nextcode chunk is only needed when a new bout of data processing comes in to check for consistency of annotations.
+
+Count all semicolons to make sure that expressions are matched:
+
+```{r}
+# comp_counts <- mutate(birds,
+#                       type_count = str_count(comparison_type, ';'),
+#                       expr_count = str_count(comparison_expression, ';'),
+#                       comparand_count = str_count(comparand, ';'),
+#                       dim_count = str_count(comp_dimension, ';')) |> 
+#   select(unique_id, type_count:dim_count) |> 
+#   filter(!is.na(type_count)) |> 
+#   filter(comparand_count != expr_count)
+# 
+# # Check these:
+# 
+# comp_counts
+```
+
+Looks good (can use above `!=` expression when new data is in).
+
+Now we need to split up the multiple entries. What we'll do is loop through all rows and if we stumble across a `';'`, we'll split strings and put them into a new table.
+
+```{r}
+# Setup empty results data frame:
+
+comp_long <- c()
+
+# Loop through rows of comp_only:
+
+for (i in 1:nrow(comp_only)) {
+  this_row <- comp_only[i, ]
+  
+  # If multi-valued cell, make copies of rows and split, else just append row:
+  
+  if (str_detect(this_row$comparison_type, ';')) {
+    # How many copies are needed?
+    
+    n_copies <- str_count(this_row$comparison_type, ';') + 1 # always one more since ; is separator
+    
+    # Temporary data frame:
+    
+    temp_df <- c()
+    for (i in 1:n_copies) {
+      temp_df <- bind_rows(temp_df, this_row)
+    }
+    
+    # Split relevant columns that need to be split:
+    
+    temp_df$comparison_type <- unlist(str_split(this_row$comparison_type, ';'))
+    temp_df$comparison_expression <- unlist(str_split(this_row$comparison_expression, ';'))
+    temp_df$comp_construction <- unlist(str_split(this_row$comp_construction, ';'))
+    temp_df$comparand <- unlist(str_split(this_row$comparand, ';'))
+    temp_df$comp_dimension <- unlist(str_split(this_row$comp_dimension, ';'))
+    
+    # Append to main tibble:
+    
+    comp_long <- bind_rows(comp_long, temp_df)
+    
+  } else {
+    comp_long <- bind_rows(comp_long, this_row)
+  }
+}
+```
+
+## Clean text of onomatopoeias and warblish
+
+Get rid of Warblish and Onomatopoeias:
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = str_replace_all(voice_reduced, '\\".+?\\"', ''),
+                voice_reduced = str_replace_all(voice_reduced, '\\*.+?\\*', ''))
+```
+
+## Other text processing
+
+Make the `voice_reduced` column lowercase:
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = str_to_lower(voice_reduced))
+```
+
+Make "far carrying" and "high pitched" and "low pitched" into words so they stick together:
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "far carrying", "far-carrying"),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "high pitched", "high-pitched"),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "higher pitched", "high-pitched"),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "higher-pitched", "high-pitched"),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "lower pitched", "low-pitched"),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "lower-pitched", "low-pitched"),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "low pitched", "low-pitched"),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "up-slurred", "upslurred"),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                "widely spaced", "widely-spaced"))
+```
+
+Match spelling of flutey, fluty, and fluting using the first:
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = str_replace_all(voice_reduced,
+                                                'fluty', 'flutey'),
+                voice_reduced = str_replace_all(voice_reduced,
+                                                'fluting', 'flutey'))
+```
+
+
+## Exclude unusables
+
+Get rid of unusables (silent, non-vocal-only, and mere statement that there is no record of a call). We'll leave `comparisons_only` in because otherwise that would be unfair to comparisons - these are comparisons after all.
+
+```{r}
+birds <- filter(birds,
+                usable %in% c('yes', 'comparison_only'))
+```
+
+## Make long format
+
+Unnest tokens in the voice dataset but don't break up hyphens:
+
+```{r}
+birds_long <- birds |> 
+  unnest_tokens(word,
+                voice_reduced,
+                token = 'regex',
+                pattern = "['?!;:, \\.\\)\\(\\)\\/]")
+```
+
+# Topic analysis
+
+Amend stop words from `tm` package:
+
+```{r}
+my_stop_words <- c(stopwords("en"), c('also', 'like', 'often', 'rather'))
+```
+
+Let's try to run a topic analysis with the current data. First, we need to setup the data with some additional cleaning steps:
+
+```{r}
+birds <- mutate(birds,
+                # voice_reduced2 = removePunctuation(voice_reduced),
+                voice_reduced2 = removeNumbers(voice_reduced),
+                voice_reduced2 = removeWords(voice_reduced, my_stop_words)
+                # voice_reduced2 = wordStem(voice_reduced, language = 'en'),
+                )
+```
+
+Get rid of the words call, note, and song as these come up in almost any description:
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced2 = str_replace_all(voice_reduced2,
+                                                 'calls|notes|songs|sounds', ''),
+                voice_reduced2 = str_replace_all(voice_reduced2,
+                                                 'call|note|song|sound', ''))
+```
+
+Split it by ';', which is the separator I use for distinct pieces of vocalization descriptions:
+
+```{r}
+chunk_df <- tibble(chunk = unlist(str_split(birds$voice_reduced2, ';')))
+```
+
+Create a corpus and term-document-matrix from this:
+
+```{r}
+# Corpus:
+
+corpus <- Corpus(VectorSource(chunk_df$chunk))
+
+# Term-document matrix:
+
+dtm <- DocumentTermMatrix(corpus, control = list(
+  stopwords = TRUE, 
+  removePunctuation = TRUE, 
+  removeNumbers = TRUE, 
+  stemming = FALSE
+))
+
+# Remove empty rows for LDA:
+
+dtm <- dtm[rowSums(as.matrix(dtm)) > 0, ]
+```
+
+Remove sparse terms:
+
+```{r}
+# dtm <- removeSparseTerms(dtm, 0.999)
+```
+
+
+
+```{r}
+# Convert DTM to required format
+# dtm_matrix <- as.matrix(dtm)
+# 
+# # Fit LDA models for different topic numbers
+# coherence_scores <- sapply(seq(2, 10, by = 1), function(k) {
+#   model <- FitLdaModel(dtm = dtm_matrix, k = k, iterations = 500, burnin = 200, seed = 1234)
+#   CalcProbCoherence(model$phi, dtm_matrix, M = 5)  # Get coherence score
+# })
+# 
+# # Plot Coherence Scores
+# plot(seq(2, 10, by = 1), coherence_scores, type = "b",
+#      xlab = "Number of Topics", ylab = "Coherence Score",
+#      main = "Coherence Score vs Number of Topics")
+```
+
+
+
+Find appropriate number of topics as per coherence score:
+
+```{r}
+# result <- FindTopicsNumber(
+#   dtm,
+#   topics = seq(2, 10, by = 1),  # Range of k values
+#   metrics = "Coherence",
+#   method = "Gibbs",
+#   control = list(seed = 1234),
+#   verbose = TRUE
+# )
+# 
+# FindTopicsNumber_plot(result)
+```
+
+
+
+Run the topic model:
+
+```{r}
+# Set number of topics:
+
+num_topics <- 6  # Adjust as needed
+
+# Run LDA:
+
+lda_model <- LDA(dtm, k = num_topics, control = list(seed = 1234))
+
+# Extract topics:
+
+topics <- tidy(lda_model, matrix = "beta")
+
+# Get top terms per topic:
+
+top_terms <- topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 5) %>%
+  ungroup() %>%
+  arrange(topic, desc(beta))
+```
+
+Show top terms:
+
+```{r}
+top_terms |> 
+  print(n = Inf)
+```
+
+# Analysis of distinctive words
+
+What are the most frequent words?
+
+```{r}
+# Count word tokens:
+
+word_count <- birds_long |> 
+  count(word, sort = TRUE) |> 
+  filter(!word %in% stop_words)
+
+# Show:
+
+word_count |> 
+  print(n = Inf)
+```
+
+Get rid of stop words and numbers:
+
+**Note**: I'm using `'one-'` here to avoid matches with words like "tone" or "lonely".
+
+```{r}
+# Number words:
+
+number_words <- c('one-', 'two', 'three',
+                  'four', 'five', 'six',
+                  'seven', 'eight', 'nine',
+                  '^ten',
+                  '^one',
+                  'triple', 'double', 'single',
+                  'bisyllabic', 'monosyllabic',
+                  'disyllabic',
+                  'trisyllabic', 'couple',
+                  'minutes', 'seconds', 'sec',
+                  'minute', 'second',
+                  'many-syllabled', 'dozen',
+                  'singly')
+
+# Exclude number words:
+
+birds_long <- filter(birds_long,
+                     !str_detect(word, str_c(number_words, collapse = '|'))) |> 
+  filter(!str_detect(word, '[0-9]'))
+
+# Load stop words from tidyverse package:
+
+data(stop_words)
+
+# Get rid of stop words via anti_join():
+
+birds_long <- birds_long |> anti_join(stop_words)
+
+# Count word tokens again:
+
+word_count <- birds_long |> 
+  count(word, sort = TRUE) |> 
+  filter(!word %in% stop_words)
+
+# Show:
+
+word_count |> 
+  print(n = Inf)
+```
+
+Get rid of the `-sounding` bits, e.g., "weak-sounding" and "wooden-sounding" can just be "weak" and "wooden":
+
+```{r}
+birds_long <- mutate(birds_long,
+                     word = str_replace_all(word, '-sounding', ''))
+```
+
+Lemmatize the long list:
+
+```{r}
+birds_long_red <- mutate(birds_long,
+                         word == lemmatize_strings(word))
+```
+
+Show again:
+
+```{r}
+# Count word tokens again:
+
+word_count <- birds_long_red |> 
+  count(word, sort = TRUE) |> 
+  filter(!word %in% stop_words)
+
+# Show again:
+
+word_count |> 
+  print(n = Inf)
+```
+
+Get rid of other words, which includes language about the sequencing, also nouns that are about variation, as well as nouns and verbs more generally, as well as words that are just degree words (mostly adverbs) and words about the author's perception, such as *remarkable* or *surprising*.
+
+```{r}
+my_stops <- c('emit', 'emits',
+              'elements', 'increases',
+              'finish', 'eventually',
+              'consists', 'combine',
+              'adds', 'tone',
+              'strongly', 'vary', 'volume',
+              'set', 'sequences', 'fairly',
+              'giving', 'bit', 'starts',
+              'consisting', 'delivered',
+              'lasts', 'extremely', 'version',
+              'typically', 'include',
+              'start', 'begin', 'run',
+              'sounding', 'periods',
+              'passages', 'pauses', 'noted',
+              'builds', 'additional', 'change',
+              'strung', 'together', 'gradually',
+              'form', 'building', 'averages',
+              'averaging', 'variation',
+              'including', 'combined',
+              'alternating', 'succession',
+              'trending', 'trend',
+              'theme', 'temp', 'tend',
+              'terminal', 'taper',
+              'suddenly', 'successions',
+              'successively', 'straight',
+              'shortened', 'shortening',
+              'separated', 'sets', 'selection',
+              'replaced', 'repertoire', 'returns',
+              'reiterated', 'quickly',
+              'question', 'answer', 'moving',
+              'momentum', 'moment', 'moments',
+              'leading', 'inserted', 'initial',
+              'final', 'incorporates',
+              'word', 'waterdrop', 'wave',
+              'voices', 'vocalizations', 'uttering',
+              'well-spaced', 'versions', 'unusually',
+              'repetitions', 'repeats', 'pair', 'pairs',
+              'multiple', 'switch', 'string', 'silence',
+              'progress', 'passage', 'middle', 'mix',
+              'forever', 'effect', 'waterdrop',
+              'diminishing', 'die', 'details',
+              'definite', 'definitive', 'contrasting',
+              'continues', 'consist',
+              'concludes', 'composed',
+              'combines', 'combination', 'close',
+              'chant', 'calling', 'broken', 'bout',
+              'background', 'average', 'alternate',
+              'alternative', 'accompanied',
+              'singing', 'pitches', 'length',
+              'inflection', 'immediately',
+              'regular', 'remarkable',
+              'speed', 'scold', 'preceded', 'preceding',
+              'mixture', 'introductory', 'initially',
+              'primary', 'tempo', 'intermixed',
+              'intermingle', 'intermingled',
+              'duet', 'intervals', 'interspersed',
+              'voice', 'variety', 'variations',
+              'times', 'sing', 'phrases', 'sounds',
+              'note', 'series', 'calls', 'call',
+              'notes', 'strengths', 'stream',
+              'kkkkkk\"', # typo
+              'irregularly', 'grow', 'gaps',
+              'forming', 'foundation', 'fragments',
+              'finally', 'extraordinary',
+              'excitement', 'emphasized', 'emphasizing',
+              'dying', 'duets', 'divided',
+              'conglomeration', 'concluding',
+              'climax', 'climaxes',
+              'cadence', 'burst', 'build',
+              'accent', 'structure', 'scale',
+              'accelerates', 'pause', 'includes',
+              'left', # in left-out
+              'noisy', # excluded because it often just refers to them being noisy, i.e., vocal
+              'beginning', 'lasting',
+              'growls', 'croaks')
+
+# More nouns:
+
+more_nouns <- c('flourish', 'duration', 'emphasis', 'cascade',
+                'noises', 'chorus', 'syllable', 'noise',
+                'bursts', 'songs', 'phrase', 'quality',
+                'sound', 'tune', 'torrent', 'forms',
+                'types', 'range', 'intensity', 'syllables',
+                'pattern', 'refrain', 'medley', 'pace', 'rhythm',
+                'flurry', # used as a noun
+                'song', 'loudness',
+                'confusion', 'cacophony',
+                'melody', 'scoldings',
+                'exhalation', 'horn',
+                'repetition', 'spiral',
+                'reel', 'mellowness',
+                'trill', 'knocks', 'trills',
+                'pitch', 'outpouring',
+                'crescendo', 'sequence')
+
+# More verbs:
+
+more_verbs <- c('scolds', 'varies', 'begins', 'moves',
+                'finishing', 'tapers', 'spaced', 'produces',
+                'pitched', 'changing', 'increasing', 'decreasing',
+                'truncating', 'sweeps', 'strengthen',
+                'strengthening', 'rolls', 'accelerate',
+                'slowing', 'repeat', 'comprises',
+                'drumming', # exclude for non because probably non-vocal
+                'drawn')
+
+# More adverbs:
+
+more_adverbs <- c('slight')
+
+# Exclude these:
+
+birds_long_red <- filter(birds_long_red,
+                         !(word %in% my_stops)) |> 
+  filter(!(word %in% more_nouns)) |> 
+  filter(!(word %in% more_verbs)) |> 
+  filter(!(word %in% more_adverbs))
+
+# Count word tokens again:
+
+word_count <- birds_long_red |> 
+  count(word, sort = TRUE) |> 
+  filter(!word %in% stop_words) |> 
+  filter(!is.na(word)) # get rid of NAs
+
+# Show again:
+
+word_count |> 
+  print(n = Inf)
+```
+
+Classify some of these words - for questionable cases regarding onomatopoeia, e.g., *wail*, I used the iconicity ratings as guide:
+
+```{r}
+onomatopoeias <- c('zing', 'yelps', 'yelping', 'yelp',
+                   'whoops', 'whooping', 'whirrs',
+                   'warbly', 'warbled', 'warblings',
+                   'wails', 'twitterlings',
+                   'twittered',
+                   'toots', 'squeaking', 'squeak',
+                   'squawking', 'squawkings', 'spinking',
+                   'shrieked', 'screechy',
+                   'purrs', 'peep', 'kip',
+                   'hum', 'howls', 'howling',
+                   'gulping', 'gurgles', 'growled',
+                   'growl', 'gobble', 'fizzing',
+                   'crow', 'croakings',
+                   'clanking', 'clacking',
+                   'churrings', 'chucks',
+                   'chortle', 'chitter',
+                   'chirrups', 'chirrup',
+                   'chirp', 'chipping', 'chippering',
+                   'chattered', 'cawing', 'cacklings',
+                   'burr', 'burbling', 'bleating',
+                   'baying', 'barked', 'squeakier',
+                   'squeak', 'squawk', 'shrieks',
+                   'shriek', 'purr', 'mew', 'jingle',
+                   'chatterings', 'chittering',
+                   'buzzes', 'wheeze',
+                   'sputtering', 'rattles',
+                   'jingling', 'jangling',
+                   'hoot', 'hisses', 'honks',
+                   'gargling', 'groans',
+                   'wheeze', 'whine', 
+                   'ticking', 
+                   'clicks', 'chirps',
+                   'cackles', 'stuttering',
+                   'shrieking', 'screeching',
+                   'quacking', 'gruff',
+                   'hoots', 'creaking', 'coos',
+                   'chuckling', 'cackle',
+                   'wailing', 'squealing',
+                   'quack', 'hiss', 'grunt',
+                   'crowing', 'cluck', 'chirping',
+                   'booming', 'barks',
+                   'bark',
+                   'wheezy',
+                   'warbles', 'squawks',
+                   'squeal', 'screech',
+                   'purring', 'hooting',
+                   'clucks', 'twitters',
+                   'squeaks', 'croacks',
+                   'clucking', 'honking',
+                   'quacks', 'gurgling',
+                   'grunts', 'cackling',
+                   'twitter', 'growling',
+                   'barking', 'chips',
+                   'cooing', 'churring',
+                   'tinkling', 'croaking',
+                   'warbling', 'buzz',
+                   'buzzing', 'chip',
+                   'hissing', 'chatter', 'chattering',
+                   'rattle', 'twittering',
+                   'shrill',
+                   'snoring', 'sneezy', 'sneezing',
+                   'snarls', 'sighs', 'moan', 'moans',
+                   'jangle', 'grunt-like',
+                   'cranking', # cranky is above 5 in iconicity ratings
+                   'cracking', 'cough', 'coughing',
+                   'buzzier', 'burp', 'yodel',
+                   'yapping', 'squeals',
+                   'peeping', 'moaning', 'murmuring',
+                   'yodelling', 'clicking',
+                   'screeches',
+                   'screaming', # more than 5, so I'll do the other ones as well:
+                   'scream', 'screams',
+                   'warble', 'squeaky',
+                   'buzzy', 'rattling',
+                   'whiny', 'whinny', 'whines',
+                   'hiccup', 'grunty',
+                   'chukled', 'whisper',
+                   'wheezing', 'rippling',
+                   'mewing', 'squeaked',
+                   'whistling', # has more than 5
+                   'ringing', # ring has more than 5
+                   'creaky', 'chuckled',
+                   'whining', # base word more than 5
+                   'croak', 'grunting',
+                   'whistles', 'whistle', 'whistled', # whistling has more than 5
+                   'rambling', # ramble above 5
+                   'rattled',
+                   'mumbled',
+                   'hiss-like',
+                   'stuttered')
+
+# Spatial metaphors:
+
+spatial_pitch <- c('ascending', 'descending',
+                   'descend',
+                   'ascends', 'descends',
+                   'high-pitched', 'upward',
+                   'downward', 'lowest', 'low-high-low',
+                   'dropping', 'downward-slurring',
+                   'rise', 'upslurred',
+                   'rises', 'low-pitched',
+                   'rising', 'low', 'high-pitched',
+                   'upslur', 'lowering',
+                   'lifts', 'lifting', 'fall',
+                   'lisping', # higher than 6
+                   'lower', 
+                   'falls', 'falling',
+                   'uplift')
+
+# Human voice descriptor:
+
+human_voice <- c('nasal', 'ventriloquial', 'throaty', 'chestier',
+                 'choking', 'laughing', 'guttural', 'strangled',
+                 'inhaled', 'talky', 'cries', 'cry',
+                 'slurred', 'spitting')
+
+# Emotional descriptors:
+
+emotional <- c('warning', 'urgent', 'wistful', 'sad', 'manic',
+               'lazy', 'lazier', 'exuberant', 'excitedly',
+               'aggressive', 'deliberate', 'anxious',
+               'angry', 'lively', 'cheery', 'cheerful',
+               'mournful', 'excited',
+               'sorrowful', 'complaining',
+               'scolding', 'incisive', 'gentle',
+               'subdued', 'peevish',
+               'agitated', 'deliberately',
+               'relaxed', 'lonely',
+               'tirelessly',
+               'rollicking',
+               'querulous',
+               'quavering',
+               'confused', 'insistent',
+               'desolately')
+
+# Gustatory words:
+
+gustatory <- c('sweet', 'sweeter', 'sweetest')
+
+# Evaluative descriptors:
+
+evaluatives <- c('unpleasant', 'beautifully', 'weird',
+                 'beautiful', 'pleasant', 'strange',
+                 'chilling', # a bit contentious?
+                 'spirited', 'delightful',
+                 'comical')
+
+# Visual descriptors:
+
+visuals <- c('bright', 'silvery', 'clear', 'clearer',
+             'clearest')
+
+# Other spatial words:
+
+spatial_other <- c('tiny', 'deep', 'hollow',
+                   'thinner', 'deeper',
+                   'thin', 'thick', 'thinner', 'thicker',
+                   'flat', 'uneven',
+                   'even-pitched', 'broad',
+                   'fuller', 'full',
+                   'level')
+
+# Complexity and variation words:
+
+complexity <- c('simple', 'complex', 'complicated',
+                'flexible', 'varied', 'rudimentary',
+                'varying', 'simpler', 'variable',
+                'simpler', 'undefined')
+
+# Distinctive / recognizability type words:
+
+distinctive <- c('distinctive', 'familiar',
+                 'characteristic', 'undistinctive',
+                 'unmistakable', 'distinct',
+                 'diagnostic', 'unique')
+
+# Haptic word:
+
+haptics <- c('sharp', 'soft',
+             'rough', 'smooth',
+             'wiry', 'tearing',
+             'smoother', 'gravelly',
+             'rougher', 'brassy',
+             'sharply', 'drier',
+             'wooden', 'softly',
+             'harder', 'metallic',
+             'mechanical', 'sharper',
+             'softer', 'hard', 'dry',
+             'sharp', 'solid',
+             'rusty', 'crisp',
+             'scratchy',
+             'coarse', 'coarser',
+             'bumpy')
+
+# Water-related:
+
+water <- c('fluid', 'liquid', 'flowing',
+           'free-flowing', 'bubbly',
+           'bubbling') # bubbly is a bit contentious
+
+# Length adjectives:
+
+length <- c('short', 'lengthy', 'extended',
+            'shorter', 'short-spaced',
+            'protracted', 'widely-spaced',
+            'prolonged', 'drawn-out',
+            'long-drawn')
+
+# Loudness / amplitude / intensity:
+
+amplitude <- c('loud', 'crescendoing',
+               'deafening', 'audible',
+               'loudest', 'loudly',
+               'faint', # arguably multisensory
+               'inaudible', 'louder',
+               'quieter', 'quiet',
+               'muted')
+
+# Strength words:
+
+strength <- c('strong', 'stronger', 'strongest',
+              'weaker', 'weak',
+              'powerful')
+
+# Speed terms:
+
+speed <- c('rapid', 'fast', 'speeded-up',
+           'fast-repeated', 'deccelerating',
+           'accelerating', 'quicker',
+           'quick', 'faster', 'slow-paced',
+           'hurried', # correct?
+           'slower', 'slow', 'slowly')
+
+# Repetition and rhythm:
+
+rhythm_repetition <- c('repetitive', 'repeated', 'rhythmic',
+                       'repeated', 'staccato', 'much-repeated',
+                       'repetitious')
+
+# Musicality or melody:
+
+musical <- c('unmelodious', 'melodious',
+             'musical', 'tuneful', 'melodic',
+             'non-musical', 'unmusical')
+
+# Movement word:
+
+movement_word <- c('bouncing', 'bouncy', 'rolled',
+                   'tumbling')
+
+# Prominence-related:
+
+prominence <- c('accented', 'emphatic', 'pronounced',
+                'prominent')
+
+# Continuity & pitch development:
+
+continuity <- c('continuous', 'constant',
+                'continuously', 'monotonous',
+                'undulating', 'lilting',
+                'fixed', 'steady',
+                'unbroken', # arguably also touch
+                'monotonously')
+
+# Match onomatopoeias:
+
+word_count <- mutate(word_count,
+                     word_type = NA,
+                     word_type = if_else(word %in% onomatopoeias, 'onomatopoeia', word_type),
+                     word_type = if_else(word %in% spatial_pitch, 'spatial_pitch', word_type),
+                     word_type = if_else(word %in% human_voice, 'human_voice', word_type),
+                     word_type = if_else(word %in% haptics, 'haptic', word_type),
+                     word_type = if_else(word %in% spatial_other, 'other_spatial', word_type),
+                     word_type = if_else(word %in% visuals, 'visual', word_type),
+                     word_type = if_else(word %in% prominence, 'prominence_word', word_type),
+                     word_type = if_else(word %in% water, 'water_related_word', word_type),
+                     word_type = if_else(word %in% evaluatives, 'evaluative', word_type),
+                     word_type = if_else(word %in% emotional, 'emotional', word_type),
+                     word_type = if_else(word %in% human_voice, 'human_voice', word_type),
+                     word_type = if_else(word %in% amplitude, 'amplitude_word', word_type),
+                     word_type = if_else(word %in% complexity, 'song_complexity_word', word_type),
+                     word_type = if_else(word %in% strength, 'strength_word', word_type),
+                     word_type = if_else(word %in% distinctive, 'distinctive_word', word_type),
+                     word_type = if_else(word %in% movement_word, 'movement_word', word_type),
+                     word_type = if_else(word %in% length, 'length_word', word_type),
+                     word_type = if_else(word %in% speed, 'speed_word', word_type),
+                     word_type = if_else(word %in% rhythm_repetition, 'rhythm_repetition_word', word_type),
+                     word_type = if_else(word %in% musical, 'musical_word', word_type),
+                     word_type = if_else(word %in% gustatory, 'taste_word', word_type))
+
+# Show again:
+
+word_count
+```
+
+Check:
+
+```{r}
+word_count |> 
+  count(word_type, sort = TRUE) |> 
+  print(n = Inf)
+```
+
+**Important note**: In these counts (that will not be reported in the talk), the human voice category is disadvantaged because many of them that are onomatopoeic (*sneezing*, *hiccup* etc.) are counted towards onomatopoeia.
+
+That is, this way of carving up the word space does not allow for multi-associations. I'll re-add those onomatopoeias that can also be ascribed to humans in the count of human voice metaphors below.
+
+# Distinctive words back into corpus
+
+## Preprocessing
+
+Re-add onomatopoeias that clearly relate to human voice to the `human_voice` vector:
+
+**Note**: Here, I only took the most obviously human-related ones, like snoring, sneezy, and yodeling. Some hard decisions will have to be made about cases like whine, scream, shriek, ... need a better measure for human-voice-relatedness. Perhaps distributional semantics?
+
+```{r}
+human_voice <- c(human_voice,
+                 c('stuttering', 'stuttered',
+                   'snoring', 'sneezy', 'sneezing',
+                   'sighs', 'cough', 'coughing',
+                   'moan', 'moans', 'burp',
+                   'yodel', 'yodelling'))
+```
+
+We'll go through the corpus and see in how many descriptions we find a conventionalized onomatopoeia, an emotional term, a haptic word, a visual word, a spatial_pitch word, an other spatial word, and a taste word.
+
+```{r}
+birds <- mutate(birds,
+                vis_metaphor = str_count(voice_reduced, str_c(visuals, collapse = '|')),
+                pitch_metaphor = str_count(voice_reduced, str_c(spatial_pitch, collapse = '|')),
+                spatial_other = str_count(voice_reduced, str_c(spatial_other, collapse = '|')),
+                taste_metaphor = str_count(voice_reduced, str_c(gustatory, collapse = '|')),
+                touch_metaphor = str_count(voice_reduced, str_c(haptics, collapse = '|')),
+                human_voice = str_count(voice_reduced, str_c(human_voice, collapse = '|')),
+                emotion_metaphor = str_count(voice_reduced, str_c(emotional, collapse = '|')),
+                conv_onom = str_count(voice_reduced, str_c(onomatopoeias, collapse = '|')))
+```
+
+Check these variables:
+
+```{r}
+birds |> select(vis_metaphor:conv_onom)
+```
+
+## Wild and tame onomatopoeia
+
+Let's compare wild and tame onomatopoeia:
+
+```{r}
+birds |> 
+  summarize(tame_onom = sum(conv_onom, na.rm = TRUE),
+            wild_onom = sum(onom_count))
+```
+
+How many have at least one of them?
+
+```{r}
+birds <- mutate(birds,
+                has_any_onom = conv_onom + onom_count,
+                has_any_onom = if_else(has_any_onom > 0, 'has onomatopoeia', 'no onomatopoeia'))
+
+# Check:
+
+birds |>
+  count(has_any_onom) |> 
+  filter(!is.na(has_any_onom)) |> 
+  mutate(p = n / sum(n))
+```
+
+93% of all entries.
+
+## Metaphor counts
+
+How many have haptic metaphors?
+
+```{r}
+birds <- mutate(birds,
+                has_haptic_metaphor = touch_metaphor,
+                has_haptic_metaphor = if_else(has_haptic_metaphor > 0, 'has haptic metaphor', 'no haptic metaphor'))
+
+# Count:
+
+birds |>
+  count(has_haptic_metaphor) |> 
+  filter(!is.na(has_haptic_metaphor)) |> 
+  mutate(p = n / sum(n))
+```
+
+How many have spatial metaphors?
+
+```{r}
+birds <- mutate(birds,
+                has_pitch_metaphor = pitch_metaphor,
+                has_pitch_metaphor = if_else(has_pitch_metaphor > 0,
+                                             'has spatial pitch metaphor',
+                                             'no spatial pitch metaphor'))
+
+# Count:
+
+birds |>
+  count(has_pitch_metaphor) |> 
+  filter(!is.na(has_pitch_metaphor)) |> 
+  mutate(p = n / sum(n))
+```
+
+How many have visual metaphors?
+
+```{r}
+birds <- mutate(birds,
+                has_visual_metaphor = vis_metaphor,
+                has_visual_metaphor = if_else(has_visual_metaphor > 0, 'has visual metaphor', 'no visual metaphor'))
+
+# Count:
+
+birds |>
+  count(has_visual_metaphor) |> 
+  filter(!is.na(has_visual_metaphor)) |> 
+  mutate(p = n / sum(n))
+```
+
+How many have human voice terms?
+
+```{r}
+birds <- mutate(birds,
+                has_voice_metaphor = human_voice,
+                has_voice_metaphor = if_else(has_voice_metaphor > 0, 'has human voice metaphor', 'no human voice metaphor'))
+
+# Count:
+
+birds |>
+  count(has_voice_metaphor) |> 
+  filter(!is.na(has_voice_metaphor)) |> 
+  mutate(p = n / sum(n))
+```
+
+How many have human emotional terms?
+
+```{r}
+birds <- mutate(birds,
+                has_emotion_metaphor = emotion_metaphor,
+                has_emotion_metaphor = if_else(has_emotion_metaphor > 0, 'has human emotion metaphor', 'no human emotion metaphor'))
+
+# Count:
+
+birds |>
+  count(has_emotion_metaphor) |> 
+  filter(!is.na(has_emotion_metaphor)) |> 
+  mutate(p = n / sum(n))
+```
+
+How many have other spatial terms like *deep* and *hollow*?
+
+```{r}
+birds <- mutate(birds,
+                has_spatial = spatial_other,
+                has_spatial = if_else(has_spatial > 0,
+                                      'has other spatial metaphor',
+                                      'no other spatial metaphor'))
+
+# Count:
+
+birds |>
+  count(has_spatial) |> 
+  filter(!is.na(has_spatial)) |> 
+  mutate(p = n / sum(n))
+```
+
+How many have any spatial, so spatial pitch (high/low/etc.) and other spatial (deep/hollow/etc.) combined?
+
+```{r}
+birds <- mutate(birds,
+                has_any_spatial = pitch_metaphor + spatial_other,
+                has_any_spatial = if_else(has_any_spatial > 0,
+                                          'has any spatial',
+                                          'no spatial'))
+
+# Count:
+
+birds |>
+  count(has_any_spatial) |> 
+  filter(!is.na(has_any_spatial)) |> 
+  mutate(p = n / sum(n))
+```
+
+
+
+# Comparisons
+
+## Comparison types and comparands
+
+Check most common comparison types:
+
+```{r}
+comp_long |> 
+  count(comparison_type, sort = TRUE) |> 
+  mutate(p = n / sum(n))
+```
+
+Create a broad bird / non-bird comparison variable, called `bird_comparison`:
+
+```{r}
+# Vector with comparison categories that involve comparisons to birds:
+
+bird_categories <- c('to_similar_species',
+                     'to_other_species',
+                     'to_other_bird_category',
+                     'to_superordinate')
+
+# Create bird_comparison variable:
+
+comp_long <- mutate(comp_long,
+                    bird_comparison = if_else(comparison_type %in% bird_categories,
+                                              'bird comparison', 'non-bird comparison'))
+```
+
+Look at frequency of this:
+
+```{r}
+comp_long |> 
+  count(bird_comparison) |> 
+  mutate(p = n / sum(n))
+```
+
+Check proportion of different bird categories within the comparisons to other birds only:
+
+```{r}
+comp_long |> 
+  filter(bird_comparison == 'bird comparison') |> 
+  count(comparison_type, sort = TRUE) |> 
+  mutate(p = n / sum(n))
+```
+
+Check proportion of different non-bird categories within the comparisons that don't involve birds only:
+
+```{r}
+comp_long |> 
+  filter(bird_comparison == 'non-bird comparison') |> 
+  count(comparison_type, sort = TRUE) |> 
+  mutate(p = n / sum(n))
+```
+
+What are the most common similar species comparisons in terms of the actual comparands?
+
+```{r}
+comp_long |> 
+  filter(comparison_type == 'to_similar_species') |> 
+  count(comparand, sort = TRUE) |> 
+  print(n = Inf)
+```
+
+When to similar species, are the comparisons mostly to songbirds?
+
+```{r}
+# comp_long |> 
+#   count(order, sort = TRUE) |> 
+#   filter(!is.na(order)) |> 
+#   mutate(p = n / sum(n))
+```
+
+How do the similar bird and other bird compare for bird order?
+
+```{r}
+# comp_long |> 
+#   count(comparison_type,
+#         order, sort = TRUE) |> 
+#   filter(!is.na(order)) |> 
+#   group_by(comparison_type) |> 
+#   mutate(p = n / sum(n))
+```
+
+What are the most common other bird category comparisons?
+
+```{r}
+comp_long |> 
+  filter(comparison_type == 'to_other_bird_category') |> 
+  count(comparand, sort = TRUE) |> 
+  print(n = Inf)
+```
+
+What are the most common comparisons to other bird species?
+
+```{r}
+comp_long |> 
+  filter(comparison_type == 'to_other_species') |> 
+  count(comparand, sort = TRUE) |> 
+  print(n = Inf)
+```
+
+Set some of these to the same and count again:
+
+```{r}
+comp_long <- mutate(comp_long,
+                    comparand = if_else(comparand == 'laying hen', 'chicken', comparand),
+                    comparand = if_else(comparand == 'rooster', 'chicken', comparand),
+                    comparand = if_else(comparand == 'domestic rooster', 'chicken', comparand))
+
+# Count again:
+
+comp_long |> 
+  filter(comparison_type == 'to_other_species') |> 
+  count(comparand, sort = TRUE) |> 
+  print(n = Inf)
+```
+
+What are the comparisons to other animals?
+
+```{r}
+comp_long |> 
+  filter(comparison_type == 'to_other_animal') |> 
+  count(comparand, sort = TRUE)
+```
+
+Collapse some of these categories and recount — we'll also collapse cicada, cricket and insect:
+
+```{r}
+comp_long <- mutate(comp_long,
+                    comparand = if_else(comparand == 'kitten', 'cat', comparand),
+                    comparand = if_else(comparand == 'fighting cats', 'cat', comparand),
+                    comparand = if_else(comparand == 'small dog', 'dog', comparand),
+                    comparand = if_else(comparand == 'distant cow mooing', 'cow', comparand),
+                    comparand = if_else(comparand == 'ground squirrel', 'squirrel', comparand),
+                    comparand = if_else(comparand == 'the oinking of a pig', 'pig', comparand),
+                    comparand = if_else(comparand == 'the sound of a galloping horse', 'horse', comparand),
+                    comparand = if_else(comparand == 'a croaking frog with a sore throat', 'frog', comparand),
+                    comparand = if_else(comparand == 'cricket', 'insect', comparand),
+                    comparand = if_else(comparand == 'cicada', 'insect', comparand))
+
+# Recount:
+
+comp_long |> 
+  filter(comparison_type == 'to_other_animal') |> 
+  count(comparand, sort = TRUE) |> 
+  mutate(p = n / sum(n))
+
+```
+
+## Comparisons dependent on onomatopoeia
+
+Of the comparisons constructions, how many have an `O` for onomatopoeia?
+
+```{r}
+comp_long <- mutate(comp_long,
+                    onomatopoeia_rel = if_else(str_detect(comp_construction, 'O'),
+                                               'with onomatopoeia',
+                                               'pure comparison'))
+
+# Count this:
+
+comp_long |> 
+  count(onomatopoeia_rel) |> 
+  mutate(p = n / sum(n))
+```
+
+## Comparison dimensions
+
+What are the comparison dimensions?
+
+```{r}
+comp_dims <- tibble(dimension = unlist(str_split(comp_long$comp_dimension, '&'))) |> 
+  filter(dimension != 'none')
+
+# Count:
+
+comp_dims |> 
+  count(dimension, sort = TRUE)
+```
+
+Collapse antonymic categories into dimensions and recount:
+
+```{r}
+# Speed, complexity and music dimensions:
+
+speeds <- c('more_rapid', 'slower', 'faster', 'faster_pace')
+complexities <- c('simpler', 'more_complex', 'more_complicated', 'more_monotonous', 'less_repetitive', 'more_repetition', 'more_varied')
+musics <- c('more_musical', 'less_musical', 'less_melodious')
+pitches <- c('higher', 'lower', 'highest', 'less_rising')
+rhythms <- c('more_rhythmic', 'less_rhythmic', 'more_staccato')
+
+# Indexing temporal development / pitch variation over time:
+
+temp_devs <- c('more_rolling', 'more_rattling', 'less_flowing',
+               'more_chattering')
+
+# Replace:
+
+comp_dims <- mutate(comp_dims,
+                    dimension = if_else(dimension %in% pitches, 'pitch', dimension),
+                    dimension = if_else(dimension %in% c('less_harsh', 'harsh', 'harsher'), 'harshness', dimension),
+                    dimension = if_else(dimension %in% c('shorter', 'longer', 'briefer'), 'duration', dimension),
+                    dimension = if_else(dimension %in% musics, 'musicality', dimension),
+                    dimension = if_else(dimension %in% c('stronger', 'weaker'), 'strength', dimension),
+                    dimension = if_else(dimension %in% c('less_flutey', 'more_flutey'), 'fluteyness', dimension),
+                    dimension = if_else(dimension %in% speeds, 'speed', dimension),
+                    dimension = if_else(dimension %in% c('more_buzzy', 'buzzier'), 'speed', dimension),
+                    dimension = if_else(dimension %in% complexities, 'complexity', dimension),
+                    dimension = if_else(dimension %in% c('louder', 'quieter'), 'amplitude', dimension),
+                    dimension = if_else(dimension %in% c('softer', 'harder'), 'hardness/softness', dimension),
+                    dimension = if_else(dimension %in% c('rougher', 'smoother'), 'roughness/smoothness', dimension),
+                    dimension = if_else(dimension %in% c('less_abrupt', 'more_abrupt'), 'abruptness', dimension),
+                    dimension = if_else(dimension %in% rhythms, 'rhythm', dimension),
+                    dimension = if_else(dimension %in% temp_devs, 'pitch_variation', dimension))
+
+# Count:
+
+comp_dims |> 
+  count(dimension, sort = TRUE) |> 
+  mutate(p = n / sum(n)) |> 
+  print(n = Inf)
+```
+
+Let's make a dimension where we collapse those words that commonly feature as timbre descriptors: "rich", "thin", "deep", "hoarse", "wooden".
+
+```{r}
+# Speed, complexity and music dimensions:
+
+timbre <- c('more_husky', 'richer', 'thinner', 'sharper', 'deeper',
+            'more_nasal', 'more_rasping', 'more_wooden',
+            'coarser', 'fuller', 'chestier', 'less_metallic',
+            'less_raucous', 'more_husky', 'more_shrill',
+            'raspier', 'clearer', 'hoarser', 'less_grating',
+            'flatter', 'drier', 'more_screeching',
+            'more_hissing', 'fluteyness', 'less_grunty',
+            'squeakier',
+            'harshness',
+            'roughness/smoothness',
+            'hardness/softness')
+
+# Others:
+
+others <- c('more_forceful', 'more_expressive',
+            'less_pronounced', 'lazier')
+
+# Replace:
+
+comp_dims <- mutate(comp_dims,
+                    dimension_red = dimension,
+                    dimension_red = if_else(dimension_red %in% timbre, 'timbre', dimension_red),
+                    dimension_red = if_else(dimension_red %in% others, 'other_dimension', dimension_red))
+
+# Count:
+
+comp_dims |> 
+  count(dimension_red, sort = TRUE) |> 
+  mutate(p = n / sum(n)) |> 
+  print(n = Inf)
+```
+
+If we further collapse the dimensions `hardness/softness`, `harshness`, and `roughness/smoothness` into the timbre category...
+
+```{r}
+# Timbre categories:
+
+timbre <- c('harshness', 'timbre', 'hardness/softness',
+            'roughness/smoothness')
+
+# Replace:
+
+comp_dims <- mutate(comp_dims,
+                    dimension_red2 = dimension_red,
+                    dimension_red2 = if_else(dimension_red2 %in% timbre, 'timbre', dimension_red))
+
+# Count:
+
+comp_dims |> 
+  count(dimension_red2, sort = TRUE) |> 
+  mutate(p = n / sum(n)) |> 
+  print(n = Inf)
+```
+
+## Comparison constructions (syntax)
+
+What are the comparison constructions?
+
+```{r}
+comp_long |> 
+  count(comp_construction, sort = TRUE)
+```
+
+Collapse the Clike/C-like O/N in a new variable called `comp_constr_simplified`, and also code for whether it is a qualified comparison, e.g., "softer than...":
+
+```{r}
+# Vector of values to match:
+
+C_likes <- c('C-like O', 'C-like N',
+             'Clike N', 'Clike O')
+
+# Craete variable:
+
+comp_long <- mutate(comp_long,
+                    comp_constr_simplified = if_else(comp_construction %in% C_likes,
+                                                     'C-like', 'perephrastic'),
+                    comp_constr_simplified = if_else(str_detect(comp_construction, "X-er"),
+                                                     'perephrastic with qualification',
+                                                     comp_constr_simplified))
+
+# Count:
+
+comp_long |> 
+  count(comp_constr_simplified) |> 
+  mutate(p = n / sum(n))
+```
+
+Cool, how are these distributed between the different categories?
+
+```{r}
+comp_constr_count <- comp_long |> 
+  filter(comparison_type != 'miscellaneous') |> 
+  mutate(comparison_type = factor(comparison_type)) |> 
+  count(comp_constr_simplified, comparison_type, .drop = FALSE) |> 
+  group_by(comp_constr_simplified) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+
+# Show:
+
+comp_constr_count |> print(n = Inf)
+```
+
+What we see here makes a whole lot of sense:
+
+- The perephrastic with qualifications (softer than, more nasal, deeper etc.) are used for comparisons to similar species. This is about learning to distinguish one bird from another very similar bird and you would want to know what dimension of sound to pay attention to. You would never want to use this really with comparisons to animals or inanimates... what good is it to know that something is softer or more mellow than a pig squeal?
+- The perephrastic without such qualifications are used to similar species much less so (40%), but these are the most general way of introducing comparison to ANYTHING, including to other species.
+- The C-like is used for general categories of birds: terns, gulls, and relatively more to other animals... what goes in here are short prototypes (robin-like, tern-like, dog-like, etc.) that are definitely familiar to the reader.
+
+Entropy function:
+
+```{r}
+entropy <- function(x) {
+  x <- if_else(x == 0, 0.001, x)
+  sum(x * log2(x)) * -1
+}
+```
+
+Let's compute the entropy for each construction, and for this we should fill out the entire table:
+
+```{r}
+comp_constr_count |> 
+  ungroup() |> 
+  group_by(comp_constr_simplified) |> 
+  summarize(entropy = entropy(p))
+```
+
+How frequent is each construction anyway?
+
+```{r}
+comp_long |> 
+  count(comp_constr_simplified, sort = TRUE) |> 
+  mutate(p = n / sum(n))
+```
+
+
+## Comparisons versus onomatopoeia
+
+Comparing comparisons against onomatopoeia & warblish:
+
+```{r}
+onom_count <- birds |> 
+  filter(usable == 'yes') |> 
+  count(onom_count) |> 
+  rename(count = onom_count)
+
+warblish_count <- birds |> 
+  filter(usable == 'yes') |> 
+  count(warblish_count) |> 
+  rename(count = warblish_count)
+
+comparison_count <- birds |> 
+  filter(usable == 'yes') |>   
+  count(comparison_count) |> 
+  rename(count = comparison_count)
+
+# Put into one:
+
+category_counts <- bind_rows(onom_count,
+                             warblish_count,
+                             comparison_count)
+
+# Define vector:
+
+categories <- c(rep('onomatopoeia', nrow(onom_count)),
+                rep('warblish', nrow(warblish_count)),
+                rep('comparison', nrow(comparison_count)))
+
+# Append to tibble:
+
+category_counts$category <- categories
+```
+
+Make a plot out of this:
+
+```{r}
+category_counts |> 
+  ggplot(aes(x = count, y = n, fill = category)) +
+  geom_col(position = 'dodge') +
+  theme_minimal()
+```
+
+What percentage have comparison, onomatopoeia, warblish?
+
+```{r}
+birds <- mutate(birds,
+                onom_01 = if_else(onom_count > 0, 1, 0),
+                warblish_01 = if_else(warblish_count > 0, 1, 0),
+                comparison_01 = if_else(comparison_count > 0, 1, 0))
+
+# Onomatopoeias:
+
+birds |> 
+  count(onom_01) |> 
+  mutate(p = n / sum(n))
+
+# Comparisons:
+
+birds |> 
+  count(comparison_01) |> 
+  mutate(p = n / sum(n))
+
+# Warblish:
+
+birds |> 
+  count(warblish_01) |> 
+  mutate(p = n / sum(n))
+```
+
+Total number of each:
+
+```{r}
+birds |> 
+  summarize(onom_total = sum(onom_count),
+            comparison_total = sum(comparison_count),
+            warblish_total = sum(warblish_count))
+```
+
+Check how much these figures differ by different field guides, comparisons:
+
+```{r}
+birds |> 
+  count(fieldguide, comparison_01) |> 
+  group_by(fieldguide) |> 
+  mutate(p = n / sum(n)) |> 
+  filter(comparison_01 == 1) |> 
+  arrange(desc(p))
+```
+
+Check how much these figures differ by different field guides, onomatopoeias:
+
+```{r}
+birds |> 
+  count(fieldguide, onom_01) |> 
+  group_by(fieldguide) |> 
+  mutate(p = n / sum(n)) |> 
+  filter(onom_01 == 1) |> 
+  arrange(desc(p))
+```
+
+
+# Comparison to smell descriptions
+
+Load iconicity ratings:
+
+```{r message = FALSE, warning = FALSE}
+icon <- read_csv('../data/iconicity_ratings_cleaned.csv')
+```
+
+Merge with bird data:
+
+```{r}
+birds_long <- left_join(birds_long,
+                        select(icon, word, rating))
+```
+
+Load in Thomas Poulton's smell descriptions:
+
+```{r message = FALSE, warning = FALSE}
+# Load:
+
+smell <- read_csv('../data/poulton_coded_descriptions.csv')
+
+# Unnest tokens:
+
+smell_long <- smell |>
+  unnest_tokens(word, DESCRIPTION)
+
+# Merge with iconicity ratings:
+
+smell_long <- left_join(smell_long,
+                        select(icon, word, rating))
+```
+
+Put the two on top of each other:
+
+```{r}
+both <- bind_rows(select(birds_long, word, rating),
+                  select(smell_long, word, rating))
+
+# Add identifiers:
+
+both$type <- c(rep('sound', nrow(birds_long)),
+               rep('smell', nrow(smell_long)))
+
+# Get rid of NAs:
+
+both <- filter(both, !is.na(rating))
+```
+
+Make a plot of this:
+
+```{r}
+# Make ggplot:
+
+both |> 
+  ggplot(aes(x = type, y = rating, fill = type)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c('#30b77d', '#efbe1b')) +
+  theme_minimal() +
+  theme(legend.position = 'none')
+
+# Save picture:
+
+ggsave('../figures/smell_sound_iconicity_boxplot.pdf',
+       width = 3.5, height = 4.5)
+```
+
+Make a density graph of this, first with smell only:
+
+```{r}
+# Make ggplot:
+
+both |> 
+  filter(type == 'smell') |> 
+  ggplot(aes(x = rating, fill = type)) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(values = '#30b77d') +
+  # scale_fill_manual(values = c('#30b77d', '#efbe1b')) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 0.8)) +
+  scale_x_continuous(limits = c(1, 9),
+                     expand = c(0, 0),
+                     breaks = 1:9) +
+  xlab("Iconicity rating") +
+  ylab(NULL) +
+  theme_classic() +
+  theme(legend.position = 'none',
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+# Save:
+
+ggsave('../figures/smell_sound_iconicity_density_smell_only.pdf',
+       width = 4, height = 3.1)
+```
+
+Now with both:
+
+```{r}
+# Make ggplot:
+
+both |> 
+  ggplot(aes(x = rating, fill = type)) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(values = c('#30b77d', '#efbe1b')) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 0.8)) +
+  scale_x_continuous(limits = c(1, 9),
+                     expand = c(0, 0),
+                     breaks = 1:9) +
+  xlab("Iconicity rating") +
+  ylab(NULL) +
+  theme_classic() +
+  theme(legend.position = 'none',
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+# Save:
+
+ggsave('../figures/smell_sound_iconicity_density.pdf',
+       width = 4, height = 3.1)
+```
+
+Check effect size of this:
+
+```{r}
+cohen.d(rating ~ type, data = both)
+```
+
+
+## Smell & comparisons
+
+Also, check source based language:
+
+```{r}
+smell <- mutate(smell,
+                has_source = if_else(SOURCE > 0, 'has source-based', 'no source-based'))
+
+# Source-based language:
+
+smell_comparison_count <- smell |> 
+  count(has_source) |> 
+  mutate(p = n / sum(n))
+
+# Show:
+
+smell_comparison_count
+```
+
+Make a plot of this versus our count:
+
+```{r}
+# Make names the same:
+
+smell_comparison_count <- smell_comparison_count |> 
+  rename(comparison_01 = has_source) |> 
+  mutate(comparison_01 = if_else(comparison_01 == 'has source-based',
+                                 'comparison', 'no comparison'))
+
+sound_comparison_count <- birds |> 
+  count(comparison_01) |> 
+  mutate(p = n / sum(n)) |> 
+  mutate(comparison_01 = if_else(comparison_01 == 0, 'no comparison',
+                                 'comparison'))
+
+# Put both together:
+
+comparison_comparison <- bind_rows(smell_comparison_count,
+                                   sound_comparison_count)
+comparison_comparison$modality <- c('smell', 'smell',
+                                    'sound', 'sound')
+
+# Make bar plot out of this:
+
+comparison_comparison |> 
+  filter(comparison_01 == 'comparison') |> 
+  ggplot(aes(x = modality, y = p, fill = modality)) +
+  geom_col(width = 0.7, col = 'black') +
+  scale_fill_manual(values = c('#30b77d', '#efbe1b')) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 0.6)) +
+  theme_classic() +
+  theme(legend.position = 'none')
+
+ggsave('../figures/comparisons_sound_smell.pdf',
+       width = 2.5, height = 3.8)
+```
+
+
+## Smell & touch words
+
+Check the smell descriptions for word frequencies and touch metaphors:
+
+```{r}
+# Get rid of stop words:
+
+smell_long <- smell_long |> anti_join(stop_words)
+
+# Tabulate most frequent words and skim for touch words:
+
+smell_long |> 
+  count(word, sort = TRUE) |> 
+  print(n = 500)
+```
+
+Check these touch words:
+
+```{r}
+smell_touch_words <- c('abrasive', 'harder', 'duller',
+                       'cutting', 'soft', 'hard',
+                       'dried', 'wet', 'warm',
+                       'sharp', 'wooden', 'texture',
+                       'sharpish', 'sharpness', 'scratch',
+                       'rough', 'cold')
+
+# Regex vector:
+
+smell_touch_words <- str_c(smell_touch_words, collapse = '|')
+
+# Are these actually used to talk about the smell itself?
+
+smell |> 
+  filter(str_detect(DESCRIPTION, smell_touch_words)) |> 
+  pull(DESCRIPTION)
+```
+
+I went through those descriptions and also checked oily (which refers to "from oil" and is used in a source-based way), and the ones that contain touch words like *soft*, *sharp*, or *abrasive* being used to describe smells are in this file:
+
+```{r}
+smell_mets <- read_lines('../data/tom_poulton_metaphorical_touch_smell_language.txt')
+```
+
+Check how many:
+
+```{r}
+# Create variable based on matching the texts above:
+
+smell <- mutate(smell,
+                has_haptic_metaphor = if_else(DESCRIPTION %in% smell_mets, 'has haptic metaphor', 'no haptic metaphor'))
+
+# Check how frequent:
+
+touch_count_smell <- smell |> 
+  count(has_haptic_metaphor) |> 
+  mutate(p = n / sum(n))
+
+# Show:
+
+touch_count_smell
+
+# Compare with the birds again:
+
+touch_count_sound <- birds |>
+  count(has_haptic_metaphor) |> 
+  filter(!is.na(has_haptic_metaphor)) |> 
+  mutate(p = n / sum(n))
+
+# Show:
+
+touch_count_sound
+```
+
+Put them both together into the same tibble:
+
+```{r}
+touch_comparison <- bind_rows(touch_count_smell,
+                              touch_count_sound)
+touch_comparison$type <- c('smell', 'smell',
+                           'sound', 'sound')
+
+touch_comparison |> 
+  filter(has_haptic_metaphor == 'has haptic metaphor') |> 
+  ggplot(aes(x = type, y = p, fill = type)) +
+  geom_col(width = 0.7, col = 'black') +
+  scale_fill_manual(values = c('#30b77d', '#efbe1b')) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 0.5)) +
+  theme_classic() +
+  theme(legend.position = 'none')
+
+ggsave('../figures/touch_metaphor_comparison_sound_smell.pdf',
+       width = 2.5, height = 3.8)
+```
+
+
+## Smell & sensory modality norms
+
+Another approach is to use the Lynott & Connell (2009) norms:
+
+```{r}
+smell_long <- left_join(smell_long, lyn)
+
+# Average tactile:
+
+smell_means <- smell_long |> 
+  rename(unique_id = `DESCRIPTION NO.`) |> 
+  group_by(unique_id) |>
+  summarize(hap_mean = mean(hap, na.rm = TRUE),
+            vis_mean = mean(vis, na.rm = TRUE),
+            aud_mean = mean(vis, na.rm = TRUE))
+
+# Summarize:
+
+smell_means |> 
+  summarize(hap_mean = mean(hap_mean, na.rm = TRUE),
+            vis_mean = mean(vis_mean, na.rm = TRUE),
+            aud_mean = mean(aud_mean, na.rm = TRUE))
+
+# For birds:
+
+birds_long <- left_join(birds_long, lyn)
+
+# Average tactile:
+
+bird_means <- birds_long |> 
+  group_by(unique_id) |>
+  summarize(hap_mean = mean(hap, na.rm = TRUE),
+            vis_mean = mean(vis, na.rm = TRUE),
+            aud_mean = mean(vis, na.rm = TRUE))
+
+# Summarize:
+
+bird_means |> 
+  summarize(hap_mean = mean(hap_mean, na.rm = TRUE),
+            vis_mean = mean(vis_mean, na.rm = TRUE),
+            aud_mean = mean(aud_mean, na.rm = TRUE))
+
+# Reduce both to relevant columns:
+
+bird_means_red <- bird_means |>
+  select(unique_id, hap_mean)
+smell_means_red <- smell_means |>
+  select(unique_id, hap_mean) |> 
+  mutate(unique_id = as.character(unique_id))
+
+# Bind together and create identifier variable:
+
+both_means <- bind_rows(bird_means_red,
+                        smell_means_red)
+both_means$type <- c(rep('sound', nrow(bird_means_red)),
+                     rep('smell', nrow(smell_means_red)))
+
+# Make ggplot:
+
+both_means |> 
+  ggplot(aes(x = hap_mean, fill = type)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  theme_minimal() +
+  theme(legend.position = 'none')
+
+# Save picture:
+
+ggsave('../figures/smell_sound_haptic_density.pdf',
+       width = 3.5, height = 4.5)
+```
+
+Pretty much completely overlapping. Why?
+
+```{r}
+filter(smell_long, !is.na(hap))$word
+```
+
+With this matching approach, all the fruity and food-related terms, which have high haptic ratings, also are matched... but these aren't really touch words. I think the other approach is more diagnostic of touch language in this case.
+
+# Which onomatopoeias most frequent?
+
+```{r}
+word_count |> 
+  filter(word_type == 'onomatopoeia') |> 
+  arrange(desc(n))
+```
+
+
+
