@@ -1,0 +1,320 @@
+---
+title: "Description of corpus"
+author: "Bodo"
+date: "16/11/2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+
+This script merges the voice sections that have been corrected by Michael Atherley (spell-checking, consistent annotation of Warblish), together with the data for which all Latin species names have been corrected / updated by Nigel Hopper. 
+
+The output is the main data frame (`birds_master_file.csv`) that is used in all remaining analyses.
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+```
+
+Get all file names:
+
+```{r message = FALSE, warning = FALSE}
+birds <- read_csv('../data/voice_all_guides_nigel_hopper_correct_species.csv')
+birds_text <- read_csv('../data/voice_all_guides_michael_atherley_corrected_text.csv')
+```
+
+Show:
+
+```{r}
+# Correct species version:
+
+sample_n(birds, 4)
+
+# Corrected text version:
+
+sample_n(birds_text, 4)
+```
+
+The corrected-species version (tibble `birds`) does not contain unique identifiers for matching. These can, however, be reconstructed:
+
+The row-randomized version that was given to Michael Atherley was based on the master file that was also the basis for Nigel Hopper's corrections.
+
+The identifiers are merely the row names with `id_` prefixed.
+
+# Merge
+
+Re-create `unique_id` column for `birds` file:
+
+```{r}
+birds <- mutate(birds,
+                unique_id = str_c('id_', 1:nrow(birds)))
+```
+
+Merge the two based on this identifier:
+
+```{r}
+birds <- left_join(birds,
+                   select(birds_text, unique_id, voice_corrected, typo, fixes, warblish),
+                   by = c('unique_id' = 'unique_id'))
+```
+
+# Check changes
+
+For how many has Nigel changed the Latin species name?
+
+```{r}
+birds |>
+  count(changed) |> 
+  mutate(p = n / sum(n))
+```
+
+For how many has Michael edited the text?
+
+```{r}
+birds |>
+  count(fixes) |> 
+  mutate(p = n / sum(n))
+```
+
+# Reduce columns
+
+We don't need all the columns, such as the uncorrected voice section, or the `match` ones:
+
+```{r}
+birds <- select(birds,
+                unique_id,
+                fieldguide, english_common, latin_species_correct, length,
+                order, family, family_english, voice_corrected, warblish)
+```
+
+Note that `english_common` is the one from the respective field guide, `english` comes from the IOC list.
+
+Rename relevant columns:
+
+```{r}
+birds <- rename(birds,
+                latin_species = latin_species_correct,
+                voice = voice_corrected)
+```
+
+# Create additional columns for annotation
+
+## Usable / not usable entries
+
+We'll create a variable for voice sections that will have to be excluded from certain counts. Specifically, we want to know whether a description merely states that the bird is just silent.
+
+I skimmed through the dataset and compiled a bunch of phrases that seem to be recurring in the textfile `full_silent_descriptions.txt`. Let's load this:
+
+```{r}
+silent <- read_lines('../data/full_silent_descriptions.txt')
+```
+
+And create a new variable called `usable` that specifies whether the description contains usable information that describes an actual sound. The default value will be `yes`, and I'll set it to `silent` if the description is, in full, one of the ones in the `silent` character vector:
+
+```{r}
+birds <- mutate(birds,
+                usable = 'yes',
+                usable = if_else(voice %in% silent, 'silent', usable))
+```
+
+In addition, those that have `NA` and "not recorded." I will mark as "no record". We'll treat that differently from silent as it doesn't necessarily mean that the bird is silent.
+
+```{r}
+birds <- mutate(birds,
+                usable = if_else(voice == 'not recorded.', 'no_record', usable),
+                usable = if_else(is.na(voice), 'no_record', usable))
+```
+
+## Reduced voice column
+
+We'll create a `voice_reduced` column. This will be hand-annotated. The goal of this column is to reduce the vocalization descriptions to only those parts that actually refer to the sound.
+
+We can, however, get rid of certain recurring phrases that don't relate to the call prior to manual annotation. I've skimmed the data and compiled a set of such phrases in the textfile `words_to_exclude.txt`:
+
+```{r}
+exclude_words <- read_lines('../data/words_to_exclude.txt')
+```
+
+Let's create a copy of the `voice` column (we'll keep the original as we'll want to check that when information may be missing or unclear from the reduced description), and then use `string_replace_all` to get rid of the phrases.
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = voice)
+```
+
+We'll loop that though as I set up the file so that bigger sections that contain smaller sections get deleted first, e.g., we'll want to exclude:
+
+`"Usually silent away from nest site. "`
+
+And then after that, `"Usually silent "`. We don't want to do the reverse because otherwise that string won't be matched.
+
+What is excluded here are mostly things about when and where birds sing (e.g., "in winter", "on high perch"), as well as information whether or not they're vocal, such as "Very vocal."
+
+We'll also exclude information about whether woodpeckers are drumming or not. The only relevant auditory word here might be "drum", but what's excluded here are really just statements about the fact that woodpeckers are drumming, e.g., in summer.
+
+Of course, the descriptions that are fully excluded (`silent`) we'll also want to replace, so we'll string these two vectors together:
+
+```{r}
+exclude_words <- c(exclude_words, silent)
+```
+
+Then we'll replace the `.` characters with `\\.` so that they are interpreted as literal matches (the character `'.'`, rather than the regular expression special character):
+
+```{r}
+exclude_words <- str_replace_all(exclude_words, '\\.', '\\\\.')
+```
+
+Now, loop through and exclude:
+
+```{r}
+for (i in seq_along(exclude_words)) {
+  this_exclude <- exclude_words[i]
+  birds <- mutate(birds,
+                  voice_reduced = str_replace_all(voice_reduced, this_exclude, ''))
+}
+```
+
+We can set those entries in `voice_reduced` that are completely nil (i.e., `usable != 'yes'`) to `NA`:
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = if_else(usable != 'yes', NA, voice_reduced))
+```
+
+Next, let's get rid of all the instances of `(...)`, largely from the Tarboton Kruger National Park guide:
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = str_replace_all(voice_reduced, '\\(\\.\\.\\.\\)', ''))
+```
+
+Get rid of leading and trailing spaces, as well as final dots.
+
+```{r}
+birds <- mutate(birds,
+                voice_reduced = str_trim(voice_reduced),
+                voice_reduced = str_replace_all(voice_reduced, '\\.$', ''))
+```
+
+## Column for non-vocalization descriptions
+
+There's a lot of descriptions of wing-flapping, drumming, or bill-clapping sounds that are not produced by the bird's vocal tract. These we'll want to put into a different column, let's call it: `non_vocalization`
+
+```{r}
+birds <- mutate(birds,
+                non_vocalization = NA)
+```
+
+# Comparisons
+
+There are more steps that need to be taken for the comparisons, so this will be an extra section.
+
+## New column for comparisons
+
+Then there's several birds who are just described in terms of other species, so there's no actual description of the call — the description of the vocalization pretty much is relegated to the description of another bird.
+
+We'll create a column for coding *whether* there is an explicit comparison to pay attention to (-like, sounds like, resembles, softer than ...), and then also whether it is the ONLY one. This will be done semi-automatically by populating a column with `no` as the default (no comparison), but we'll use the following key words to populate them with `yes` (they contain a comparison), and then hand-check after:
+
+- *-like
+- resembles 
+- similar to
+- reminiscent
+
+```{r}
+# Setup string to match for comparisons:
+
+common_comparisons <- c('resembl',
+                        'similar',
+                        'like',
+                        'reminiscent',
+                        'different',
+                        'recall')
+common_comparisons <- str_c(common_comparisons, collapse = '|')
+
+# Match those:
+
+birds <- mutate(birds,
+                comparison = if_else(str_detect(voice_reduced, common_comparisons),
+                                     'comparison', 'no_comparison'),
+                comparison = if_else(usable != 'yes', NA, comparison))
+```
+
+## Load the old data
+
+We have some data that is already annotated. This is in the folder `../data/old_annotations/comparison/`.
+
+We'll load all those files names in here and save it into a vector:
+
+```{r}
+all_files <- list.files('../data/old_annotations/comparisons')
+
+# Corresponding vector of field guides:
+
+fieldguides <- str_replace_all(all_files, '_coded.csv', '')
+
+# Check that the names haven't changed:
+
+fieldguides %in% birds$fieldguide
+```
+
+We'll set up the comparison annotation columns in the main tibble:
+
+```{r}
+birds <- mutate(birds,
+                Comparison = NA,
+                Comparand = NA,
+                ComparisonConstruction = NA,
+                ContrastDimension = NA)
+```
+
+The order within each file hasn't changed compared to the big `birds` tibble, i.e., the Simpson Day guide starts with the Great Crested Grebe and finishes with the House Crow, in the file we're loading in, and in the main dataset. This means we can just put the relevant columns into here in order:
+
+```{r warning = FALSE, message = FALSE}
+for (i in seq_along(all_files)) {
+  # Get file:
+  
+  this_data <- read_csv(str_c('../data/old_annotations/comparisons/', all_files[i]))
+  
+  # Insert values into respective rows/columns:
+  
+  birds[birds$fieldguide == fieldguides[i], ]$Comparison <- this_data$Comparison
+  birds[birds$fieldguide == fieldguides[i], ]$Comparand <- this_data$Comparand
+  birds[birds$fieldguide == fieldguides[i], ]$ComparisonConstruction <- this_data$ComparisonConstruction
+  birds[birds$fieldguide == fieldguides[i], ]$ContrastDimension <- this_data$ContrastDimension
+}
+```
+
+## Change comparison column names
+
+The column names are in ugly camel case. Let's make it into snake case.
+
+```{r}
+birds <- rename(birds,
+                comparison_expression = Comparison,
+                comparand = Comparand,
+                comp_construction = ComparisonConstruction,
+                comp_dimension = ContrastDimension)
+```
+
+# Randomize order
+
+For annotation, we'll randomize the order:
+
+```{r}
+set.seed(42) # my lucky number
+birds <- sample_n(birds, nrow(birds))
+```
+
+Write this to file:
+
+```{r}
+write_csv(birds, '../data/birds_master_file.csv')
+```
+

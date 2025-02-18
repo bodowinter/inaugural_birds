@@ -1,0 +1,94 @@
+---
+title: "Description of corpus"
+author: "Bodo"
+date: "16/11/2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Description of the corpus
+
+This script merely characterizes the corpus. It works as a brief reference to get an overview of how many birds, words etc. there are:
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(tidytext) # for unnest_tokens()
+```
+
+Get all file names:
+
+```{r message = FALSE, warning = FALSE}
+birds <- read_csv('../data/birds_master_file.csv')
+```
+
+# Summary information
+
+How many entries altogether?
+
+```{r}
+nrow(birds)
+```
+
+How many per field guide?
+
+```{r}
+birds |> count(fieldguide)
+```
+
+How many bird species?
+
+```{r}
+birds |> 
+  count(latin_species, sort = TRUE)
+```
+
+How many per species?
+
+```{r}
+birds |> 
+  count(latin_species, sort = TRUE) |> 
+  summarize(mean_entries = mean(n))
+```
+
+Approximately 3 per species...
+
+# Word count
+
+Let's do word counts without onomatopoeia and Warblish:
+
+```{r}
+birds <- birds |> 
+  mutate(voice_no_onom = str_replace_all(voice, '\\".+?\\"', ''),
+         voice_no_onom = str_replace_all(voice_no_onom, '\\*.+?\\*', ''))
+```
+
+Count the tokens, excluding onomatopoeia and warblish:
+
+```{r}
+birds |> 
+  unnest_tokens(word,
+                voice_no_onom) |> 
+  nrow()
+```
+
+138,338 tokens. Note that this includes genitive 's as separate word (I guess defensible since it is a particle/clitic), and excludes onomatopoeia and warblish.
+
+Count the tokens, including onomatopoeia and warblish:
+
+```{r}
+birds |> 
+  unnest_tokens(word,
+                voice) |> 
+  nrow()
+```
+
+159,630 words then.
+
+

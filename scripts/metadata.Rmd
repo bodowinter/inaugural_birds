@@ -1,0 +1,81 @@
+---
+title: "Bird talk analysis: metadata / typographic highlighting"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load data
+
+Part of the larger linguistic analysis of the language of bird vocalizations.
+
+In this script, we'll merely look at the metadata, which includes information about authors etc., and whether and how onomatopoeias are typographically highlighted.
+
+Load libraries:
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+```
+
+Load the metadata:
+
+```{r message = FALSE, warning = FALSE}
+meta <- read_csv('../data/fieldguides_metadata.csv')
+```
+
+# Descriptive stats
+
+Range of years across field guides:
+
+```{r}
+range(meta$current_edition)
+```
+
+How many authors?
+
+```{r}
+meta %>% 
+  count(author, sort = TRUE)
+```
+
+17 distinct author teams.
+
+Check typographic highlighting:
+
+```{r}
+# Plot basics:
+
+typo_p <- meta %>% 
+  count(onomatopoeia_highlighting, sort = TRUE) %>% 
+  bind_rows(tibble(onomatopoeia_highlighting = 'no highlighting', n = 0)) %>% 
+  ggplot(aes(x = reorder(onomatopoeia_highlighting, n), y = n)) +
+  geom_col(fill = 'steelblue', col = 'black', width = 0.6)
+
+# Axes and scales:
+
+typo_p <- typo_p +
+  xlab(NULL) +
+  ylab('Number of field guides') +
+  coord_cartesian(ylim = c(0, 12)) +
+  scale_y_continuous(expand = c(0, 0),
+                     breaks = seq(0, 12, 2))
+
+# Cosmetics:
+
+typo_p <- typo_p +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.y = element_text(face = 'bold',
+                                    margin = margin(r = 10)))
+
+# Show and save:
+
+typo_p
+ggsave(plot = typo_p,
+       filename = '../figures/typographic_highlighting.pdf',
+       width = 5, height = 3)
+```
+
+This completes this analysis.
