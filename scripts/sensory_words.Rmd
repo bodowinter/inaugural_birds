@@ -791,6 +791,10 @@ evaluatives <- c('unpleasant', 'beautifully', 'weird',
 visuals <- c('bright', 'silvery', 'clear', 'clearer',
              'clearest')
 
+# Taste:
+
+taste <- c('sweet', 'sweeter')
+
 # Other spatial words:
 
 spatial_other <- c('tiny', 'deep', 'hollow',
@@ -924,6 +928,7 @@ word_count <- mutate(word_count,
                      word_type = if_else(word %in% distinctive, 'distinctive_word', word_type),
                      word_type = if_else(word %in% movement_word, 'movement_word', word_type),
                      word_type = if_else(word %in% length, 'length_word', word_type),
+                     word_type = if_else(word %in% taste, 'taste_word', word_type),
                      word_type = if_else(word %in% speed, 'speed_word', word_type),
                      word_type = if_else(word %in% rhythm_repetition, 'rhythm_repetition_word', word_type),
                      word_type = if_else(word %in% musical, 'musical_word', word_type),
@@ -942,7 +947,7 @@ word_count |>
   print(n = Inf)
 ```
 
-**Important note**: In these counts (that will not be reported in the talk), the human voice category is disadvantaged because many of them that are onomatopoeic (*sneezing*, *hiccup* etc.) are counted towards onomatopoeia.
+**Important note**: In these counts (that will not be reported in the talk), the human voice category is disadvantaged because many of them that are onomatopoeic (*sneezing*, *hiccup* etc.) are counted towards onomatopoeia. That will be fixed below when we look at human voice terms, where I'll re-merge some of the clearly human-voice related onomatopoeias back into the human voice category.
 
 That is, this way of carving up the word space does not allow for multi-associations. I'll re-add those onomatopoeias that can also be ascribed to humans in the count of human voice metaphors below.
 
@@ -1012,7 +1017,7 @@ birds |>
 
 ## Metaphor counts
 
-How many have haptic metaphors?
+How many have haptic metaphors? ("linguistic synesthesia", or "synesthetic metaphors")
 
 ```{r}
 birds <- mutate(birds,
@@ -1027,7 +1032,7 @@ birds |>
   mutate(p = n / sum(n))
 ```
 
-How many have spatial metaphors?
+How many have spatial metaphors? ("linguistic synesthesia", or "synesthetic metaphors")
 
 ```{r}
 birds <- mutate(birds,
@@ -1044,7 +1049,7 @@ birds |>
   mutate(p = n / sum(n))
 ```
 
-How many have visual metaphors?
+How many have visual metaphors? ("linguistic synesthesia", or "synesthetic metaphors")
 
 ```{r}
 birds <- mutate(birds,
@@ -1056,6 +1061,21 @@ birds <- mutate(birds,
 birds |>
   count(has_visual_metaphor) |> 
   filter(!is.na(has_visual_metaphor)) |> 
+  mutate(p = n / sum(n))
+```
+
+How many have taste metaphors? ("linguistic synesthesia", or "synesthetic metaphors")
+
+```{r}
+birds <- mutate(birds,
+                has_taste_metaphor = taste_metaphor,
+                has_taste_metaphor = if_else(has_taste_metaphor > 0, 'has taste metaphor', 'no taste metaphor'))
+
+# Count:
+
+birds |>
+  count(has_taste_metaphor) |> 
+  filter(!is.na(has_taste_metaphor)) |> 
   mutate(p = n / sum(n))
 ```
 
@@ -1122,6 +1142,29 @@ birds |>
   filter(!is.na(has_any_spatial)) |> 
   mutate(p = n / sum(n))
 ```
+
+Any of these metaphor counts?
+
+```{r}
+birds <- mutate(birds,
+                has_any_metaphor = if_else(has_any_spatial == 'has any spatial'|
+                                             has_haptic_metaphor == 'has haptic metaphor' |
+                                             has_emotion_metaphor == 'has human emotion metaphor' |
+                                             has_taste_metaphor == 'has taste metaphor' |
+                                             has_voice_metaphor == 'has human emotion metaphor' |
+                                             has_visual_metaphor == 'has visual metaphor',
+                        'has metaphor', 'none of these metaphors'))
+```
+
+Check count:
+
+```{r}
+birds |>
+  count(has_any_metaphor) |> 
+  filter(!is.na(has_any_metaphor)) |> 
+  mutate(p = n / sum(n))
+```
+
 
 
 
